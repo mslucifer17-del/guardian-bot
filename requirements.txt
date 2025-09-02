@@ -1,0 +1,6 @@
+python-telegram-bot==20.7
+google-generativeai
+flask
+waitress
+psycopg2-binary
+python-dotenv
