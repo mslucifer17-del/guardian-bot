@@ -1,0 +1,409 @@
+import os
+import threading
+import asyncio
+import re
+import logging
+from flask import Flask
+import google.generativeai as genai
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from collections import defaultdict
+import psycopg2
+from datetime import datetime
+
+# Configuration
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0").strip())
+DATABASE_URL = os.environ.get("DATABASE_URL")
+PORT = int(os.environ.get('PORT', 8080))
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# AI Setup for Spam Detection
+SPAM_DETECTION_PROMPT = """You are a vigilant spam detection AI for Telegram. Analyze messages and:
+1. Reply with "SPAM" if it contains promotions, scams, ads, or suspicious links
+2. Reply with "OK" for normal messages
+3. Consider cultural context and multiple languages
+4. Pay special attention to CP (child porn), adult content, selling, and illegal activities"""
+genai.configure(api_key=GEMINI_API_KEY)
+spam_model = genai.GenerativeModel(model_name='gemini-1.5-flash', system_instruction=SPAM_DETECTION_PROMPT)
+
+# In-memory stores
+user_warnings = defaultdict(int)
+user_last_message = defaultdict(datetime)
+blacklist_words = set()
+allowed_chats = set()
+
+# Advanced spam patterns
+spam_patterns = [
+    r"lowest price", r"premium collection", r"dm for purchase", r"payment method",
+    r"combo no\d", r"latest updated", r"desi cp", r"indian cp", r"foreign cp",
+    r"tamil cp", r"chinese cp", r"arabians cp", r"bro-sis cp", r"dad-daughter cp",
+    r"pedo mom-son cp", r"premium cp", r"content collection", r"price available",
+    r"payment method", r"upi|paypal|crypto|gift card"
+]
+payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
+
+# Database Functions
+def db_connect():
+    return psycopg2.connect(DATABASE_URL)
+
+def setup_database():
+    conn = db_connect()
+    with conn.cursor() as cur:
+        # Blacklist table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blacklist (
+                id SERIAL PRIMARY KEY,
+                word TEXT NOT NULL UNIQUE,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Allowed chats table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS allowed_chats (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL UNIQUE,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Custom commands table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS custom_commands (
+                id SERIAL PRIMARY KEY,
+                command TEXT NOT NULL UNIQUE,
+                response TEXT NOT NULL,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Reported spam table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reported_spam (
+                id SERIAL PRIMARY KEY,
+                message TEXT NOT NULL,
+                reported_by BIGINT,
+                reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    conn.commit()
+    conn.close()
+
+def load_blacklist():
+    global blacklist_words
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT word FROM blacklist")
+        blacklist_words = {row[0].lower() for row in cur.fetchall()}
+    critical_words = ["cp", "child", "porn", "premium", "collection", "price", "payment", "purchase", "desi", "indian", "foreign", "tamil", "chinese", "arabian", "bro-sis", "dad-daughter", "pedo"]
+    for word in critical_words:
+        if word not in blacklist_words:
+            try:
+                with db_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word, ADMIN_USER_ID))
+                        conn.commit()
+            except: pass
+    logger.info(f"Loaded {len(blacklist_words)} words from blacklist")
+
+def load_allowed_chats():
+    global allowed_chats
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT chat_id FROM allowed_chats")
+        allowed_chats = {row[0] for row in cur.fetchall()}
+    conn.close()
+    logger.info(f"Loaded {len(allowed_chats)} allowed chats")
+
+# Advanced detection functions
+def contains_hidden_links(text):
+    patterns = [r'[🟢💰📣⬇️➖➗]+\s*[\w\s]+\s*[🟢💰📣⬇️➖➗]+', r'[\w\.-]+\.[a-zA-Z]{2,}', r'@[\w]+\s*[\w]*\s*(offer|deal|price|sale)', r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+']
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+def detect_spam_patterns(text):
+    for pattern in spam_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True, f"Spam pattern detected: {pattern}"
+    return False, ""
+
+def normalize_text(text):
+    normalized = re.sub(r'[^\w\s@\.\-$]', ' ', text)
+    normalized = re.sub(r'\s+', ' ', normalized).strip().lower()
+    return normalized
+
+# Custom command system
+async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command = update.message.text.split()[0][1:].lower()
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT response FROM custom_commands WHERE command = %s", (command,))
+        result = cur.fetchone()
+    conn.close()
+    if result:
+        await update.message.reply_text(result[0])
+
+# Admin commands
+async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can add commands")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addcommand <name> <response>")
+        return
+    command = context.args[0].lower()
+    response = " ".join(context.args[1:])
+    conn = db_connect()
+    with conn.cursor() as cur:
+        try:
+            cur.execute("INSERT INTO custom_commands (command, response, added_by) VALUES (%s, %s, %s)", (command, response, update.effective_user.id))
+            conn.commit()
+            await update.message.reply_text(f"✅ Command /{command} added successfully!")
+        except psycopg2.IntegrityError:
+            await update.message.reply_text(f"❌ Command /{command} already exists")
+    conn.close()
+
+async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ Please reply to a spam message to report it.")
+        return
+    spam_message = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO reported_spam (message, reported_by) VALUES (%s, %s)", (spam_message, update.effective_user.id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ Spam reported! Thank you for helping improve our protection.")
+    logger.info(f"Spam reported by user {update.effective_user.id}: {spam_message[:50]}...")
+
+async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text(f"❌ Only admin can allow chats (Your ID: {update.effective_user.id}, Admin ID: {ADMIN_USER_ID})")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /allowchat <chat_id>")
+        return
+    try:
+        chat_id = int(context.args[0])
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
+        conn.commit()
+        conn.close()
+        allowed_chats.add(chat_id)
+        await update.message.reply_text(f"✅ Chat {chat_id} added to allowed list")
+        logger.info(f"Chat {chat_id} allowed by admin {update.effective_user.id}")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid chat ID. Must be a number.")
+
+async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can use this command.")
+        return
+    chat_id = update.effective_chat.id
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
+    conn.commit()
+    conn.close()
+    allowed_chats.add(chat_id)
+    await update.message.reply_text(f"✅ Okay! I will now be active in this chat (ID: {chat_id}).")
+
+async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can view allowed chats")
+        return
+    if not allowed_chats:
+        await update.message.reply_text("No chats are currently allowed.")
+        return
+    chats_list = "\n".join(str(chat_id) for chat_id in allowed_chats)
+    await update.message.reply_text(f"Allowed chats:\n{chats_list}")
+
+# Flask App for Keep-Alive
+flask_app = Flask(__name__)
+@flask_app.route('/')
+def home():
+    return "🛡️ Guardian Bot is running and vigilant!"
+def run_flask():
+    from waitress import serve
+    serve(flask_app, host='0.0.0.0', port=PORT)
+
+# Telegram Bot Logic
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🛡️ Hello! I'm Guardian Bot\n\nI protect groups from spam and scams with AI-powered detection.\nUse /help to see available commands.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can use this command")
+        return
+    help_text = """
+    🛡️ *Admin Commands:*
+    /addword <words> - Add words to blacklist
+    /delword <words> - Remove words from blacklist
+    /listwords - Show blacklisted words
+    /addcommand <name> <response> - Add custom command
+    /allowchat <chat_id> - Allow a chat to use bot
+    /allowthischat - Allow the current chat to use bot
+    /listchats - List all allowed chats
+    /stats - Show protection statistics
+    
+    👥 *User Commands:*
+    /report - Reply to a spam message to report it
+    
+    ⚙️ *Features:*
+    • AI-powered spam detection
+    • Blacklist system
+    • Flood protection
+    • Link prevention
+    • Auto-moderation
+    • Advanced pattern detection
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can add words")
+        return
+    words_to_add = {word.lower() for word in context.args}
+    if not words_to_add:
+        await update.message.reply_text("Usage: /addword <word1> <word2>...")
+        return
+    conn = db_connect()
+    with conn.cursor() as cur:
+        added_count = 0
+        for word in words_to_add:
+            try:
+                cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s)",(word, update.effective_user.id))
+                added_count += 1
+            except psycopg2.IntegrityError:
+                continue
+    conn.commit()
+    conn.close()
+    load_blacklist()
+    await update.message.reply_text(f"✅ Added {added_count} word(s) to blacklist")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can view stats")
+        return
+    stats_text = f"""
+    📊 *Guardian Bot Statistics*
+    
+    • Blacklisted words: {len(blacklist_words)}
+    • Allowed chats: {len(allowed_chats)}
+    • Active warnings: {len(user_warnings)}
+    • AI Model: Gemini 1.5 Flash
+    """
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+# Message handling with advanced protection
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.from_user: return
+    
+    user = update.message.from_user
+    chat_id = update.effective_chat.id
+    message = update.message
+    
+    if chat_id not in allowed_chats: return
+    
+    now = datetime.now()
+    if user.id in user_last_message and (now - user_last_message[user.id]).seconds < 2:
+        try: await message.delete()
+        except: pass
+        return
+    user_last_message[user.id] = now
+    
+    is_admin = False
+    if chat_id > 0:
+        if str(user.id) == str(ADMIN_USER_ID): is_admin = True
+    else:
+        try:
+            chat_admins = await context.bot.get_chat_administrators(chat_id)
+            admin_ids = {admin.user.id for admin in chat_admins}
+            if user.id in admin_ids or str(user.id) == str(ADMIN_USER_ID): is_admin = True
+        except Exception as e:
+            logger.error(f"Error checking admin status: {e}")
+            if str(user.id) == str(ADMIN_USER_ID): is_admin = True
+    
+    if is_admin: return
+            
+    text = message.text or message.caption or ""
+    text_lower = text.lower()
+    normalized_text = normalize_text(text)
+    is_spam = False
+    reason = ""
+
+    logger.info(f"Message from {user.id}: {text[:100]}...")
+
+    if any(entity.type in ['url', 'text_link'] for entity in message.entities or []): is_spam, reason = True, "Links are not allowed"
+    if not is_spam and contains_hidden_links(text): is_spam, reason = True, "Hidden links detected"
+    if not is_spam and '@' in text and not text.startswith('/'): is_spam, reason = True, "Mentions are not allowed"
+    if not is_spam and (message.forward_from or message.forward_from_chat): is_spam, reason = True, "Forwarded messages are not allowed"
+    if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)): is_spam, reason = True, "Blacklisted word detected"
+    if not is_spam and any(term in text_lower for term in payment_terms): is_spam, reason = True, "Payment terms detected"
+    if not is_spam:
+        pattern_detected, pattern_reason = detect_spam_patterns(text_lower)
+        if pattern_detected: is_spam, reason = True, pattern_reason
+        
+    if not is_spam and text:
+        try:
+            analysis_text = f"Original: {text}\nNormalized: {normalized_text}"
+            response = await asyncio.wait_for(spam_model.generate_content_async(analysis_text), timeout=7.0)
+            logger.info(f"AI Response: {response.text}")
+            if "SPAM" in response.text.upper(): is_spam, reason = True, "AI detected spam content"
+        except Exception as e:
+            logger.error(f"Gemini error: {e}")
+
+    if is_spam:
+        try:
+            await message.delete()
+            user_warnings[user.id] += 1
+            warning_count = user_warnings[user.id]
+            if warning_count >= 3:
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {user.mention_html()} has been banned after 3 warnings.", parse_mode='HTML')
+                del user_warnings[user.id]
+                logger.info(f"User {user.id} banned for spam: {reason}")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3", parse_mode='HTML')
+                logger.info(f"Spam detected from user {user.id}: {reason}")
+        except Exception as e:
+            logger.error(f"Action error: {e}")
+
+def main():
+    setup_database()
+    load_blacklist()
+    load_allowed_chats()
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("addword", addword))
+    application.add_handler(CommandHandler("addcommand", addcommand))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("report", report_spam))
+    application.add_handler(CommandHandler("allowchat", allowchat))
+    application.add_handler(CommandHandler("allowthischat", allowthischat))
+    application.add_handler(CommandHandler("listchats", listchats))
+    
+    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats)'
+    application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
+    
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+
+    logger.info("🛡️ Guardian Bot is now running with enhanced detection...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    main()
