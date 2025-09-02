@@ -39,7 +39,7 @@ user_warnings = defaultdict(int)
 user_last_message = defaultdict(datetime)
 blacklist_words = set()
 allowed_chats = set()
-forward_whitelist_users = set() # Naya set whitelist ke liye
+forward_whitelist_users = set()
 
 # Advanced spam patterns
 spam_patterns = [
@@ -58,13 +58,10 @@ def db_connect():
 def setup_database():
     conn = db_connect()
     with conn.cursor() as cur:
-        # Purane Tables
         cur.execute("CREATE TABLE IF NOT EXISTS blacklist (id SERIAL PRIMARY KEY, word TEXT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         cur.execute("CREATE TABLE IF NOT EXISTS allowed_chats (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         cur.execute("CREATE TABLE IF NOT EXISTS custom_commands (id SERIAL PRIMARY KEY, command TEXT NOT NULL UNIQUE, response TEXT NOT NULL, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         cur.execute("CREATE TABLE IF NOT EXISTS reported_spam (id SERIAL PRIMARY KEY, message TEXT NOT NULL, reported_by BIGINT, reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        
-        # Nayi Table Forward Whitelist ke liye
         cur.execute("""
             CREATE TABLE IF NOT EXISTS forward_whitelist (
                 id SERIAL PRIMARY KEY,
@@ -139,6 +136,10 @@ async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(result[0])
 
 # Admin commands
+async def botversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) == str(ADMIN_USER_ID):
+        await update.message.reply_text("✅ Guardian Bot v2.1 - Channel Post Fix Applied.")
+
 async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
         await update.message.reply_text("❌ Only admin can add commands")
@@ -214,7 +215,6 @@ async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chats_list = "\n".join(str(chat_id) for chat_id in allowed_chats)
     await update.message.reply_text(f"Allowed chats:\n{chats_list}")
 
-# Naye Admin Commands
 async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
         await update.message.reply_text("❌ Only admin can use this command.")
@@ -251,13 +251,12 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Only admin can use this command.")
         return
 
-    user_to_revoke = None
+    user_id_to_revoke = None
     if update.message.reply_to_message:
-        user_to_revoke = update.message.reply_to_message.from_user
+        user_id_to_revoke = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            user_id = int(context.args[0])
-            # We don't need to fetch the user object just to delete from DB
+            user_id_to_revoke = int(context.args[0])
         except (ValueError, IndexError):
             await update.message.reply_text("Usage: Reply to a user or provide their User ID.")
             return
@@ -265,15 +264,14 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: Reply to a user's message or use /revokeforward <user_id>")
         return
         
-    user_id_to_revoke = user_to_revoke.id if user_to_revoke else int(context.args[0])
-    
-    conn = db_connect()
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM forward_whitelist WHERE user_id = %s", (user_id_to_revoke,))
-    conn.commit()
-    conn.close()
-    forward_whitelist_users.discard(user_id_to_revoke)
-    await update.message.reply_text(f"❌ User {user_id_to_revoke} can no longer forward messages.")
+    if user_id_to_revoke:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM forward_whitelist WHERE user_id = %s", (user_id_to_revoke,))
+        conn.commit()
+        conn.close()
+        forward_whitelist_users.discard(user_id_to_revoke)
+        await update.message.reply_text(f"❌ User {user_id_to_revoke} can no longer forward messages.")
 
 async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
@@ -314,6 +312,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /revokeforward <user_id> - Revoke forward permission
     /listforwarders - List users who can forward
     /stats - Show protection statistics
+    /botversion - Check bot version
     
     👥 *User Commands:*
     /report - Reply to a spam message to report it
@@ -381,7 +380,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_admins = await context.bot.get_chat_administrators(chat_id)
             admin_ids = {admin.user.id for admin in chat_admins}
-            if user.id in admin_ids or str(user.id) == str(ADMIN_USER_ID): is_admin = True
+            # YAHAN BADLAAV KIYA GAYA HAI - Channel poster ID (136817688) ko admin maana jayega
+            if user.id in admin_ids or str(user.id) == str(ADMIN_USER_ID) or user.id == 136817688: 
+                is_admin = True
         except Exception as e:
             logger.error(f"Error checking admin status: {e}")
             if str(user.id) == str(ADMIN_USER_ID): is_admin = True
@@ -438,7 +439,7 @@ def main():
     setup_database()
     load_blacklist()
     load_allowed_chats()
-    load_forward_whitelist() # Nayi whitelist ko load karein
+    load_forward_whitelist()
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -455,8 +456,9 @@ def main():
     application.add_handler(CommandHandler("allowforward", allowforward))
     application.add_handler(CommandHandler("revokeforward", revokeforward))
     application.add_handler(CommandHandler("listforwarders", listforwarders))
+    application.add_handler(CommandHandler("botversion", botversion)) # Version command
     
-    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders)'
+    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
     
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
