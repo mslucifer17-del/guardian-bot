@@ -39,6 +39,7 @@ user_warnings = defaultdict(int)
 user_last_message = defaultdict(datetime)
 blacklist_words = set()
 allowed_chats = set()
+forward_whitelist_users = set() # Naya set whitelist ke liye
 
 # Advanced spam patterns
 spam_patterns = [
@@ -57,41 +58,19 @@ def db_connect():
 def setup_database():
     conn = db_connect()
     with conn.cursor() as cur:
-        # Blacklist table
+        # Purane Tables
+        cur.execute("CREATE TABLE IF NOT EXISTS blacklist (id SERIAL PRIMARY KEY, word TEXT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS allowed_chats (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS custom_commands (id SERIAL PRIMARY KEY, command TEXT NOT NULL UNIQUE, response TEXT NOT NULL, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        cur.execute("CREATE TABLE IF NOT EXISTS reported_spam (id SERIAL PRIMARY KEY, message TEXT NOT NULL, reported_by BIGINT, reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        
+        # Nayi Table Forward Whitelist ke liye
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS blacklist (
+            CREATE TABLE IF NOT EXISTS forward_whitelist (
                 id SERIAL PRIMARY KEY,
-                word TEXT NOT NULL UNIQUE,
+                user_id BIGINT NOT NULL UNIQUE,
                 added_by BIGINT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Allowed chats table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS allowed_chats (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL UNIQUE,
-                added_by BIGINT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Custom commands table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS custom_commands (
-                id SERIAL PRIMARY KEY,
-                command TEXT NOT NULL UNIQUE,
-                response TEXT NOT NULL,
-                added_by BIGINT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Reported spam table
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS reported_spam (
-                id SERIAL PRIMARY KEY,
-                message TEXT NOT NULL,
-                reported_by BIGINT,
-                reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
     conn.commit()
@@ -122,6 +101,15 @@ def load_allowed_chats():
         allowed_chats = {row[0] for row in cur.fetchall()}
     conn.close()
     logger.info(f"Loaded {len(allowed_chats)} allowed chats")
+
+def load_forward_whitelist():
+    global forward_whitelist_users
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT user_id FROM forward_whitelist")
+        forward_whitelist_users = {row[0] for row in cur.fetchall()}
+    conn.close()
+    logger.info(f"Loaded {len(forward_whitelist_users)} users from forward whitelist")
 
 # Advanced detection functions
 def contains_hidden_links(text):
@@ -226,6 +214,78 @@ async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chats_list = "\n".join(str(chat_id) for chat_id in allowed_chats)
     await update.message.reply_text(f"Allowed chats:\n{chats_list}")
 
+# Naye Admin Commands
+async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can use this command.")
+        return
+
+    user_to_allow = None
+    if update.message.reply_to_message:
+        user_to_allow = update.message.reply_to_message.from_user
+    elif context.args:
+        try:
+            user_id = int(context.args[0])
+            user_to_allow = await context.bot.get_chat(user_id)
+        except (ValueError, IndexError):
+            await update.message.reply_text("Usage: Reply to a user or provide their User ID.")
+            return
+        except Exception as e:
+            await update.message.reply_text(f"Could not find user. Error: {e}")
+            return
+    else:
+        await update.message.reply_text("Usage: Reply to a user's message or use /allowforward <user_id>")
+        return
+
+    if user_to_allow:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO forward_whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_to_allow.id, update.effective_user.id))
+        conn.commit()
+        conn.close()
+        forward_whitelist_users.add(user_to_allow.id)
+        await update.message.reply_text(f"✅ User {user_to_allow.first_name} ({user_to_allow.id}) can now forward messages.")
+
+async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can use this command.")
+        return
+
+    user_to_revoke = None
+    if update.message.reply_to_message:
+        user_to_revoke = update.message.reply_to_message.from_user
+    elif context.args:
+        try:
+            user_id = int(context.args[0])
+            # We don't need to fetch the user object just to delete from DB
+        except (ValueError, IndexError):
+            await update.message.reply_text("Usage: Reply to a user or provide their User ID.")
+            return
+    else:
+        await update.message.reply_text("Usage: Reply to a user's message or use /revokeforward <user_id>")
+        return
+        
+    user_id_to_revoke = user_to_revoke.id if user_to_revoke else int(context.args[0])
+    
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM forward_whitelist WHERE user_id = %s", (user_id_to_revoke,))
+    conn.commit()
+    conn.close()
+    forward_whitelist_users.discard(user_id_to_revoke)
+    await update.message.reply_text(f"❌ User {user_id_to_revoke} can no longer forward messages.")
+
+async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can view this list.")
+        return
+    if not forward_whitelist_users:
+        await update.message.reply_text("No users are currently allowed to forward messages.")
+        return
+    
+    users_list = "\n".join(str(user_id) for user_id in forward_whitelist_users)
+    await update.message.reply_text(f"Users allowed to forward:\n{users_list}")
+
 # Flask App for Keep-Alive
 flask_app = Flask(__name__)
 @flask_app.route('/')
@@ -246,24 +306,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
     🛡️ *Admin Commands:*
     /addword <words> - Add words to blacklist
-    /delword <words> - Remove words from blacklist
-    /listwords - Show blacklisted words
     /addcommand <name> <response> - Add custom command
-    /allowchat <chat_id> - Allow a chat to use bot
-    /allowthischat - Allow the current chat to use bot
-    /listchats - List all allowed chats
+    /allowchat <chat_id> - Allow a chat by ID
+    /allowthischat - Allow the current chat
+    /listchats - List allowed chats
+    /allowforward <user_id> - Allow a user to forward (reply or use ID)
+    /revokeforward <user_id> - Revoke forward permission
+    /listforwarders - List users who can forward
     /stats - Show protection statistics
     
     👥 *User Commands:*
     /report - Reply to a spam message to report it
-    
-    ⚙️ *Features:*
-    • AI-powered spam detection
-    • Blacklist system
-    • Flood protection
-    • Link prevention
-    • Auto-moderation
-    • Advanced pattern detection
     """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -298,6 +351,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     • Blacklisted words: {len(blacklist_words)}
     • Allowed chats: {len(allowed_chats)}
+    • Allowed forwarders: {len(forward_whitelist_users)}
     • Active warnings: {len(user_warnings)}
     • AI Model: Gemini 1.5 Flash
     """
@@ -342,10 +396,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Message from {user.id}: {text[:100]}...")
 
-    if any(entity.type in ['url', 'text_link'] for entity in message.entities or []): is_spam, reason = True, "Links are not allowed"
+    # Strict Rules
+    if (message.forward_from or message.forward_from_chat) and (user.id not in forward_whitelist_users):
+        is_spam, reason = True, "You do not have permission to forward messages"
+
+    if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []): is_spam, reason = True, "Links are not allowed"
     if not is_spam and contains_hidden_links(text): is_spam, reason = True, "Hidden links detected"
     if not is_spam and '@' in text and not text.startswith('/'): is_spam, reason = True, "Mentions are not allowed"
-    if not is_spam and (message.forward_from or message.forward_from_chat): is_spam, reason = True, "Forwarded messages are not allowed"
     if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)): is_spam, reason = True, "Blacklisted word detected"
     if not is_spam and any(term in text_lower for term in payment_terms): is_spam, reason = True, "Payment terms detected"
     if not is_spam:
@@ -381,6 +438,7 @@ def main():
     setup_database()
     load_blacklist()
     load_allowed_chats()
+    load_forward_whitelist() # Nayi whitelist ko load karein
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -394,8 +452,11 @@ def main():
     application.add_handler(CommandHandler("allowchat", allowchat))
     application.add_handler(CommandHandler("allowthischat", allowthischat))
     application.add_handler(CommandHandler("listchats", listchats))
+    application.add_handler(CommandHandler("allowforward", allowforward))
+    application.add_handler(CommandHandler("revokeforward", revokeforward))
+    application.add_handler(CommandHandler("listforwarders", listforwarders))
     
-    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats)'
+    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
     
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
