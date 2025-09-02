@@ -17,6 +17,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0").strip())
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get('PORT', 8080))
+# Add your channel ID here
+CHANNEL_ID = -1002533091260  # Replace with your actual channel ID
 
 # Setup logging
 logging.basicConfig(
@@ -66,6 +68,15 @@ def setup_database():
             CREATE TABLE IF NOT EXISTS forward_whitelist (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL UNIQUE,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Add table for allowed channels
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS allowed_channels (
+                id SERIAL PRIMARY KEY,
+                channel_id BIGINT NOT NULL UNIQUE,
                 added_by BIGINT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -284,6 +295,26 @@ async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_list = "\n".join(str(user_id) for user_id in forward_whitelist_users)
     await update.message.reply_text(f"Users allowed to forward:\n{users_list}")
 
+# New function to allow channels
+async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+        await update.message.reply_text("❌ Only admin can allow channels")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /allowchannel <channel_id>")
+        return
+    try:
+        channel_id = int(context.args[0])
+        conn = db_connect()
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO allowed_channels (channel_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (channel_id, update.effective_user.id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"✅ Channel {channel_id} added to allowed channels")
+        logger.info(f"Channel {channel_id} allowed by admin {update.effective_user.id}")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid channel ID. Must be a number.")
+
 # Flask App for Keep-Alive
 flask_app = Flask(__name__)
 @flask_app.route('/')
@@ -311,6 +342,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /allowforward <user_id> - Allow a user to forward (reply or use ID)
     /revokeforward <user_id> - Revoke forward permission
     /listforwarders - List users who can forward
+    /allowchannel <channel_id> - Allow a channel to post without restrictions
     /stats - Show protection statistics
     /botversion - Check bot version
     
@@ -358,36 +390,56 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Message handling with advanced protection
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.from_user: return
+    if not update.message or not update.message.from_user: 
+        # Check if this is a channel post
+        if update.channel_post:
+            # Allow all channel posts from your channel
+            if update.channel_post.chat.id == CHANNEL_ID:
+                logger.info(f"Allowed channel post from {CHANNEL_ID}")
+                return
+        return
     
     user = update.message.from_user
     chat_id = update.effective_chat.id
     message = update.message
     
-    if chat_id not in allowed_chats: return
+    if chat_id not in allowed_chats: 
+        # Check if this is a forwarded message from your channel
+        if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
+            logger.info(f"Allowed forwarded message from channel {CHANNEL_ID}")
+            return
+        return
     
     now = datetime.now()
     if user.id in user_last_message and (now - user_last_message[user.id]).seconds < 2:
-        try: await message.delete()
-        except: pass
+        try: 
+            await message.delete()
+        except: 
+            pass
         return
     user_last_message[user.id] = now
     
     is_admin = False
     if chat_id > 0:
-        if str(user.id) == str(ADMIN_USER_ID): is_admin = True
+        if str(user.id) == str(ADMIN_USER_ID): 
+            is_admin = True
     else:
         try:
             chat_admins = await context.bot.get_chat_administrators(chat_id)
             admin_ids = {admin.user.id for admin in chat_admins}
-            # YAHAN BADLAAV KIYA GAYA HAI - Channel poster ID (136817688) ko admin maana jayega
-            if user.id in admin_ids or str(user.id) == str(ADMIN_USER_ID) or user.id == 136817688: 
+            # Allow channel posts and forwarded messages from your channel
+            if (user.id in admin_ids or 
+                str(user.id) == str(ADMIN_USER_ID) or 
+                user.id == 136817688 or  # Your channel poster ID
+                (message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID)):
                 is_admin = True
         except Exception as e:
             logger.error(f"Error checking admin status: {e}")
-            if str(user.id) == str(ADMIN_USER_ID): is_admin = True
+            if str(user.id) == str(ADMIN_USER_ID): 
+                is_admin = True
     
-    if is_admin: return
+    if is_admin: 
+        return
             
     text = message.text or message.caption or ""
     text_lower = text.lower()
@@ -397,25 +449,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Message from {user.id}: {text[:100]}...")
 
+    # Skip spam checks for messages from your channel
+    if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
+        logger.info(f"Skipping spam check for message from channel {CHANNEL_ID}")
+        return
+
     # Strict Rules
     if (message.forward_from or message.forward_from_chat) and (user.id not in forward_whitelist_users):
         is_spam, reason = True, "You do not have permission to forward messages"
 
-    if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []): is_spam, reason = True, "Links are not allowed"
-    if not is_spam and contains_hidden_links(text): is_spam, reason = True, "Hidden links detected"
-    if not is_spam and '@' in text and not text.startswith('/'): is_spam, reason = True, "Mentions are not allowed"
-    if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)): is_spam, reason = True, "Blacklisted word detected"
-    if not is_spam and any(term in text_lower for term in payment_terms): is_spam, reason = True, "Payment terms detected"
+    if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []): 
+        is_spam, reason = True, "Links are not allowed"
+    if not is_spam and contains_hidden_links(text): 
+        is_spam, reason = True, "Hidden links detected"
+    if not is_spam and '@' in text and not text.startswith('/'): 
+        is_spam, reason = True, "Mentions are not allowed"
+    if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)): 
+        is_spam, reason = True, "Blacklisted word detected"
+    if not is_spam and any(term in text_lower for term in payment_terms): 
+        is_spam, reason = True, "Payment terms detected"
     if not is_spam:
         pattern_detected, pattern_reason = detect_spam_patterns(text_lower)
-        if pattern_detected: is_spam, reason = True, pattern_reason
+        if pattern_detected: 
+            is_spam, reason = True, pattern_reason
         
     if not is_spam and text:
         try:
             analysis_text = f"Original: {text}\nNormalized: {normalized_text}"
             response = await asyncio.wait_for(spam_model.generate_content_async(analysis_text), timeout=7.0)
             logger.info(f"AI Response: {response.text}")
-            if "SPAM" in response.text.upper(): is_spam, reason = True, "AI detected spam content"
+            if "SPAM" in response.text.upper(): 
+                is_spam, reason = True, "AI detected spam content"
         except Exception as e:
             logger.error(f"Gemini error: {e}")
 
@@ -456,9 +520,10 @@ def main():
     application.add_handler(CommandHandler("allowforward", allowforward))
     application.add_handler(CommandHandler("revokeforward", revokeforward))
     application.add_handler(CommandHandler("listforwarders", listforwarders))
-    application.add_handler(CommandHandler("botversion", botversion)) # Version command
+    application.add_handler(CommandHandler("botversion", botversion))
+    application.add_handler(CommandHandler("allowchannel", allowchannel))  # New command
     
-    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion)'
+    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
     
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
