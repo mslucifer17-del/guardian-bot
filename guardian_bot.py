@@ -55,6 +55,24 @@ spam_patterns = [
 ]
 payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
 
+# Auto-delete functionality for bot messages
+async def delete_message_after_delay(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int = 10):
+    """Delete a message after a specified delay"""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        # Message might have already been deleted or bot doesn't have permissions
+        if "message to delete not found" not in str(e).lower():
+            logger.error(f"Could not delete message {message_id} in chat {chat_id}: {e}")
+
+async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, delay: int = 10):
+    """Send a message that will be automatically deleted after delay"""
+    message = await update.message.reply_text(text)
+    # Schedule this message for deletion
+    asyncio.create_task(delete_message_after_delay(update.effective_chat.id, message.message_id, context, delay))
+    return message
+
 # Database Functions
 def db_connect():
     try:
@@ -181,10 +199,10 @@ async def botversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can add commands")
+        await send_auto_delete_message(update, context, "❌ Only admin can add commands", 10)
         return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addcommand <name> <response>")
+        await send_auto_delete_message(update, context, "Usage: /addcommand <name> <response>", 10)
         return
     command = context.args[0].lower()
     response = " ".join(context.args[1:])
@@ -204,7 +222,7 @@ async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Please reply to a spam message to report it.")
+        await send_auto_delete_message(update, context, "❌ Please reply to a spam message to report it.", 10)
         return
     spam_message = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
     conn = db_connect()
@@ -221,10 +239,10 @@ async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text(f"❌ Only admin can allow chats (Your ID: {update.effective_user.id}, Admin ID: {ADMIN_USER_ID})")
+        await send_auto_delete_message(update, context, f"❌ Only admin can allow chats (Your ID: {update.effective_user.id}, Admin ID: {ADMIN_USER_ID})", 10)
         return
     if not context.args:
-        await update.message.reply_text("Usage: /allowchat <chat_id>")
+        await send_auto_delete_message(update, context, "Usage: /allowchat <chat_id>", 10)
         return
     try:
         chat_id = int(context.args[0])
@@ -241,11 +259,11 @@ async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Chat {chat_id} added to allowed list")
         logger.info(f"Chat {chat_id} allowed by admin {update.effective_user.id}")
     except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID. Must be a number.")
+        await send_auto_delete_message(update, context, "❌ Invalid chat ID. Must be a number.", 10)
 
 async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can use this command.")
+        await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
         return
     chat_id = update.effective_chat.id
     conn = db_connect()
@@ -262,7 +280,7 @@ async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can view allowed chats")
+        await send_auto_delete_message(update, context, "❌ Only admin can view allowed chats", 10)
         return
     if not allowed_chats:
         await update.message.reply_text("No chats are currently allowed.")
@@ -272,7 +290,7 @@ async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can use this command.")
+        await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
         return
 
     user_to_allow = None
@@ -283,13 +301,13 @@ async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = int(context.args[0])
             user_to_allow = await context.bot.get_chat(user_id)
         except (ValueError, IndexError):
-            await update.message.reply_text("Usage: Reply to a user or provide their User ID.")
+            await send_auto_delete_message(update, context, "Usage: Reply to a user or provide their User ID.", 10)
             return
         except Exception as e:
             await update.message.reply_text(f"Could not find user. Error: {e}")
             return
     else:
-        await update.message.reply_text("Usage: Reply to a user's message or use /allowforward <user_id>")
+        await send_auto_delete_message(update, context, "Usage: Reply to a user's message or use /allowforward <user_id>", 10)
         return
 
     if user_to_allow:
@@ -307,7 +325,7 @@ async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can use this command.")
+        await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
         return
 
     user_id_to_revoke = None
@@ -317,10 +335,10 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user_id_to_revoke = int(context.args[0])
         except (ValueError, IndexError):
-            await update.message.reply_text("Usage: Reply to a user or provide their User ID.")
+            await send_auto_delete_message(update, context, "Usage: Reply to a user or provide their User ID.", 10)
             return
     else:
-        await update.message.reply_text("Usage: Reply to a user's message or use /revokeforward <user_id>")
+        await send_auto_delete_message(update, context, "Usage: Reply to a user's message or use /revokeforward <user_id>", 10)
         return
         
     if user_id_to_revoke:
@@ -338,7 +356,7 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can view this list.")
+        await send_auto_delete_message(update, context, "❌ Only admin can view this list.", 10)
         return
     if not forward_whitelist_users:
         await update.message.reply_text("No users are currently allowed to forward messages.")
@@ -350,10 +368,10 @@ async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # New function to allow channels
 async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can allow channels")
+        await send_auto_delete_message(update, context, "❌ Only admin can allow channels", 10)
         return
     if not context.args:
-        await update.message.reply_text("Usage: /allowchannel <channel_id>")
+        await send_auto_delete_message(update, context, "Usage: /allowchannel <channel_id>", 10)
         return
     try:
         channel_id = int(context.args[0])
@@ -369,7 +387,7 @@ async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Channel {channel_id} added to allowed channels")
         logger.info(f"Channel {channel_id} allowed by admin {update.effective_user.id}")
     except ValueError:
-        await update.message.reply_text("❌ Invalid channel ID. Must be a number.")
+        await send_auto_delete_message(update, context, "❌ Invalid channel ID. Must be a number.", 10)
 
 # Error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,7 +419,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can use this command")
+        await send_auto_delete_message(update, context, "❌ Only admin can use this command", 10)
         return
     help_text = """
     🛡️ *Admin Commands:*
@@ -424,11 +442,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can add words")
+        await send_auto_delete_message(update, context, "❌ Only admin can add words", 10)
         return
     words_to_add = {word.lower() for word in context.args}
     if not words_to_add:
-        await update.message.reply_text("Usage: /addword <word1> <word2>...")
+        await send_auto_delete_message(update, context, "Usage: /addword <word1> <word2>...", 10)
         return
     conn = db_connect()
     if not conn:
@@ -450,7 +468,7 @@ async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await update.message.reply_text("❌ Only admin can view stats")
+        await send_auto_delete_message(update, context, "❌ Only admin can view stats", 10)
         return
     stats_text = f"""
     📊 *Guardian Bot Statistics*
@@ -476,6 +494,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     chat_id = update.effective_chat.id
     message = update.message
+    
+    # Check if message is from any bot and schedule for deletion
+    if user.is_bot:
+        # Schedule deletion after 10 seconds for all bot messages
+        asyncio.create_task(
+            delete_message_after_delay(chat_id, message.message_id, context, 10)
+        )
+        # Skip further processing for bot messages
+        return
     
     # Rate limiting
     current_time = time.time()
@@ -565,11 +592,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warning_count = user_warnings[user.id]
             if warning_count >= 3:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {user.mention_html()} has been banned after 3 warnings.", parse_mode='HTML')
+                warning_msg = f"⚠️ {user.mention_html()} has been banned after 3 warnings."
+                sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
+                # Schedule the warning message for deletion
+                asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
                 del user_warnings[user.id]
                 logger.info(f"User {user.id} banned for spam: {reason}")
             else:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3", parse_mode='HTML')
+                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3"
+                sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
+                # Schedule the warning message for deletion
+                asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
                 logger.info(f"Spam detected from user {user.id}: {reason}")
         except Exception as e:
             if "message to delete not found" not in str(e).lower():
