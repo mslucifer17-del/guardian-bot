@@ -20,7 +20,7 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0").strip())
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get('PORT', 8080))
 # Add your channel ID here
-CHANNEL_ID = -1002533091260  # Replace with your actual channel ID
+CHANNEL_ID = -1002533091260 # Replace with your actual channel ID
 
 # Setup logging
 logging.basicConfig(
@@ -56,46 +56,52 @@ spam_patterns = [
 ]
 payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
 
-# --- Enhanced Auto-delete Functionality ---
+# Auto-delete functionality for bot messages
+async def delete_message_after_delay(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int = 10):
+    """Delete a message after a specified delay, with checks for existence."""
+    await asyncio.sleep(delay)
+    try:
+        # Check if message still exists before attempting deletion
+        try:
+            await context.bot.get_message(chat_id=chat_id, message_id=message_id)
+            # If get_message succeeds, the message exists, so attempt deletion
+            await delete_message_with_retry(chat_id, message_id, context)
+        except Exception as e:
+            # This exception is likely due to the message not being found.
+            # Telegram API errors might include "message to delete not found" or "bad request: message to delete not found"
+            if "message to delete not found" in str(e).lower() or "bad request: message to delete not found" in str(e).lower():
+                logger.info(f"Message {message_id} in chat {chat_id} already deleted, skipping deletion attempt.")
+            else:
+                logger.error(f"Error while checking message existence for deletion of {message_id} in chat {chat_id}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in delete_message_after_delay for message {message_id} in chat {chat_id}: {e}")
+
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
     wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
-    retry=tenacity.retry_if_exception_type(Exception),
-    reraise=True # Re-raise exceptions after retries if they persist
+    retry=tenacity.retry_if_exception_type(Exception), # Retry on any exception during deletion
+    before_sleep=lambda retry_state: logger.warning(f"Retrying deletion for message {retry_state.args[1]} in chat {retry_state.args[0]}... Attempt {retry_state.attempt_number + 1}")
 )
 async def delete_message_with_retry(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Attempts to delete a message with retries."""
+    """Delete a message with retry logic for Telegram API rate limits or temporary issues."""
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.debug(f"Successfully deleted message {message_id} in chat {chat_id}.")
     except Exception as e:
         logger.error(f"Failed to delete message {message_id} in chat {chat_id} after retries: {e}")
-        # If it's a "message to delete not found" error, we can ignore it as it's already gone.
-        if "message to delete not found" not in str(e).lower() and "bad request: message to delete not found" not in str(e).lower():
-            raise # Re-raise if it's another type of error
-
-async def delete_message_after_delay(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int = 10):
-    """Delete a message after a specified delay, checking if it exists first."""
-    await asyncio.sleep(delay)
-    try:
-        # First, try to get the message to see if it still exists.
-        # This avoids unnecessary delete attempts on already removed messages.
-        await context.bot.get_message(chat_id=chat_id, message_id=message_id)
-        # If get_message succeeds, then attempt deletion with retries
-        await delete_message_with_retry(chat_id, message_id, context)
-    except Exception as e:
-        # Handle cases where get_message fails (e.g., message not found)
-        if "message not found" in str(e).lower() or "bad request: message not found" in str(e).lower():
-            logger.info(f"Message {message_id} in chat {chat_id} was already deleted or not found, skipping deletion.")
-        else:
-            logger.error(f"Error during delete_message_after_delay for message {message_id} in chat {chat_id}: {e}")
+        # Re-raise the exception so tenacity can catch it and retry
+        raise
 
 async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, delay: int = 10):
     """Send a message that will be automatically deleted after delay"""
-    message = await update.message.reply_text(text)
-    # Schedule this message for deletion
-    asyncio.create_task(delete_message_after_delay(update.effective_chat.id, message.message_id, context, delay))
-    return message
-# --- End Enhanced Auto-delete Functionality ---
+    try:
+        message = await update.message.reply_text(text)
+        # Schedule this message for deletion
+        asyncio.create_task(delete_message_after_delay(update.effective_chat.id, message.message_id, context, delay))
+        return message
+    except Exception as e:
+        logger.error(f"Failed to send auto-delete message: {e}")
+        return None
 
 # Database Functions
 def db_connect():
@@ -484,7 +490,7 @@ async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s)",(word, update.effective_user.id))
                 added_count += 1
             except psycopg2.IntegrityError:
-                continue
+                continue # Word already exists
     conn.commit()
     conn.close()
     load_blacklist()
@@ -507,9 +513,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Message handling with advanced protection
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Check if this is a channel post from your channel
+    # Check if this is a channel post from your channel and if it's allowed
     if update.channel_post and update.channel_post.chat.id == CHANNEL_ID:
-        logger.info(f"Allowed channel post from {CHANNEL_ID}")
+        # If the message is from the configured channel, we allow it and do not process further.
+        # This prevents the bot from acting on its own posts in its designated channel.
+        logger.info(f"Ignoring message from configured channel {CHANNEL_ID}")
         return
 
     if not update.message or not update.message.from_user:
@@ -528,10 +536,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Skip further processing for bot messages
         return
 
-    # Rate limiting
+    # Rate limiting for messages within the same chat from the same user
     current_time = time.time()
     user_key = f"{user.id}_{chat_id}"
-    if user_key in message_rate_limit and current_time - message_rate_limit[user_key] < 2:
+    if user_key in message_rate_limit and current_time - message_rate_limit[user_key] < 1: # Reduced to 1 second for responsiveness
+        try:
+            await message.delete() # Delete rapid duplicate messages
+            logger.debug(f"Deleted rapid duplicate message from {user.id} in chat {chat_id}")
+        except Exception as e:
+            if "message to delete not found" not in str(e).lower():
+                logger.error(f"Failed to delete rapid duplicate message: {e}")
         return
     message_rate_limit[user_key] = current_time
 
@@ -544,26 +558,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     now = datetime.now()
-    if user.id in user_last_message and (now - user_last_message[user.id]).seconds < 2:
+    # User last message check for very rapid messages (less than 2 seconds apart)
+    if user.id in user_last_message and (now - user_last_message[user.id]).total_seconds() < 2:
         try:
             await message.delete()
+            logger.debug(f"Deleted message from {user.id} due to rapid sending in chat {chat_id}")
         except Exception as e:
             if "message to delete not found" not in str(e).lower():
-                logger.error(f"Failed to delete message: {e}")
+                logger.error(f"Failed to delete rapid message: {e}")
         return
     user_last_message[user.id] = now
 
     is_admin = False
-    if chat_id > 0:
+    if chat_id > 0: # Private chat
         if str(user.id) == str(ADMIN_USER_ID):
             is_admin = True
-    else:
+    else: # Group or supergroup
         try:
             chat_member = await context.bot.get_chat_member(chat_id, user.id)
             if chat_member.status in ['administrator', 'creator']:
                 is_admin = True
         except Exception as e:
-            logger.error(f"Error checking user status: {e}")
+            logger.error(f"Error checking user status in chat {chat_id} for user {user.id}: {e}")
+            # Fallback for admin ID check if get_chat_member fails
             if str(user.id) == str(ADMIN_USER_ID):
                 is_admin = True
 
@@ -576,61 +593,78 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_spam = False
     reason = ""
 
-    logger.info(f"Message from {user.id}: {text[:100]}...")
+    logger.info(f"Processing message from {user.id} in chat {chat_id}: '{text[:100]}...'")
 
     # Strict Rules
     if (message.forward_from or message.forward_from_chat) and (user.id not in forward_whitelist_users):
-        is_spam, reason = True, "You do not have permission to forward messages"
+        is_spam, reason = True, "You do not have permission to forward messages."
 
+    # Check for links only if not already marked as spam
     if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []):
-        is_spam, reason = True, "Links are not allowed"
+        is_spam, reason = True, "Links are not allowed in this chat."
+
+    # Check for hidden links
     if not is_spam and contains_hidden_links(text):
-        is_spam, reason = True, "Hidden links detected"
+        is_spam, reason = True, "Suspicious hidden links detected."
+
+    # Check for mentions (only if not starting with a command)
     if not is_spam and '@' in text and not text.startswith('/'):
-        is_spam, reason = True, "Mentions are not allowed"
+        is_spam, reason = True, "Mentions are not allowed in this chat."
+
+    # Check against blacklist words
     if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)):
-        is_spam, reason = True, "Blacklisted word detected"
+        is_spam, reason = True, "Message contains blacklisted words."
+
+    # Check for payment terms
     if not is_spam and any(term in text_lower for term in payment_terms):
-        is_spam, reason = True, "Payment terms detected"
+        is_spam, reason = True, "Message contains payment-related terms."
+
+    # Check against advanced spam patterns
     if not is_spam:
         pattern_detected, pattern_reason = detect_spam_patterns(text_lower)
         if pattern_detected:
             is_spam, reason = True, pattern_reason
 
+    # AI Detection if still not marked as spam
     if not is_spam and text:
         try:
-            analysis_text = f"Original: {text}\nNormalized: {normalized_text}"
-            response = await asyncio.wait_for(spam_model.generate_content_async(analysis_text), timeout=7.0)
-            logger.info(f"AI Response: {response.text}")
+            # Prepare content for AI, ensuring it's not excessively long
+            ai_input_text = f"Original: {text}\nNormalized: {normalized_text}"
+            response = await asyncio.wait_for(spam_model.generate_content_async(ai_input_text), timeout=7.0)
+            logger.info(f"AI Spam Analysis Response: {response.text}")
             if "SPAM" in response.text.upper():
-                is_spam, reason = True, "AI detected spam content"
+                is_spam, reason = True, "AI detected spam content."
         except asyncio.TimeoutError:
-            logger.warning("Gemini AI timeout, skipping analysis")
+            logger.warning("Gemini AI timeout occurred. Skipping AI analysis for this message.")
         except Exception as e:
-            logger.error(f"Gemini error: {e}")
+            logger.error(f"Error during Gemini AI content generation: {e}")
 
+    # Actions if spam is detected
     if is_spam:
         try:
             await message.delete()
             user_warnings[user.id] += 1
             warning_count = user_warnings[user.id]
+
             if warning_count >= 3:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
-                warning_msg = f"⚠️ {user.mention_html()} has been banned after 3 warnings."
+                warning_msg = f"⚠️ {user.mention_html()} has been banned after 3 warnings for spam."
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
-                # Schedule the warning message for deletion
-                asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
-                del user_warnings[user.id]
-                logger.info(f"User {user.id} banned for spam: {reason}")
+                asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 15)) # Longer delay for ban message
+                if user.id in user_warnings: # Clean up warnings after ban
+                    del user_warnings[user.id]
+                logger.info(f"User {user.id} banned for spam. Reason: {reason}")
             else:
-                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3"
+                warning_msg = f"⚠️ {user.mention_html()}, your message was flagged as spam ({reason}). Warning {warning_count}/3."
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
-                # Schedule the warning message for deletion
                 asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
-                logger.info(f"Spam detected from user {user.id}: {reason}")
+                logger.info(f"Spam detected from user {user.id} in chat {chat_id}. Reason: {reason}")
         except Exception as e:
-            if "message to delete not found" not in str(e).lower():
-                logger.error(f"Action error: {e}")
+            logger.error(f"Error performing spam action (delete/ban/warn) for user {user.id} in chat {chat_id}: {e}")
+            # If deletion failed, it might be due to permissions or message already gone.
+            if "message to delete not found" in str(e).lower():
+                logger.warning(f"Message {message.message_id} from {user.id} not found for deletion, likely already removed.")
+
 
 def main():
     setup_database()
@@ -659,15 +693,18 @@ def main():
     application.add_handler(CommandHandler("botversion", botversion))
     application.add_handler(CommandHandler("allowchannel", allowchannel)) # New command
 
-    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
-    application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
+    # Handle custom commands that are not predefined
+    command_list_regex = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
+    application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list_regex), handle_custom_command))
 
+    # Handle all other messages (non-command)
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    logger.info("🛡️ Guardian Bot is now running with enhanced detection...")
+    logger.info("🛡️ Guardian Bot is now running with enhanced detection and auto-delete fix...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    # Run the Flask app in a separate thread for keep-alive
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     main()
