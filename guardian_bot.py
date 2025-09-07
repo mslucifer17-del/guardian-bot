@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from collections import defaultdict
 import psycopg2
 from datetime import datetime
+import tenacity # Import tenacity for retries
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -55,16 +56,38 @@ spam_patterns = [
 ]
 payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
 
-# Auto-delete functionality for bot messages
-async def delete_message_after_delay(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int = 10):
-    """Delete a message after a specified delay"""
-    await asyncio.sleep(delay)
+# --- Enhanced Auto-delete Functionality ---
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(3),
+    wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+    retry=tenacity.retry_if_exception_type(Exception),
+    reraise=True # Re-raise exceptions after retries if they persist
+)
+async def delete_message_with_retry(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Attempts to delete a message with retries."""
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception as e:
-        # Message might have already been deleted or bot doesn't have permissions
-        if "message to delete not found" not in str(e).lower():
-            logger.error(f"Could not delete message {message_id} in chat {chat_id}: {e}")
+        logger.error(f"Failed to delete message {message_id} in chat {chat_id} after retries: {e}")
+        # If it's a "message to delete not found" error, we can ignore it as it's already gone.
+        if "message to delete not found" not in str(e).lower() and "bad request: message to delete not found" not in str(e).lower():
+            raise # Re-raise if it's another type of error
+
+async def delete_message_after_delay(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int = 10):
+    """Delete a message after a specified delay, checking if it exists first."""
+    await asyncio.sleep(delay)
+    try:
+        # First, try to get the message to see if it still exists.
+        # This avoids unnecessary delete attempts on already removed messages.
+        await context.bot.get_message(chat_id=chat_id, message_id=message_id)
+        # If get_message succeeds, then attempt deletion with retries
+        await delete_message_with_retry(chat_id, message_id, context)
+    except Exception as e:
+        # Handle cases where get_message fails (e.g., message not found)
+        if "message not found" in str(e).lower() or "bad request: message not found" in str(e).lower():
+            logger.info(f"Message {message_id} in chat {chat_id} was already deleted or not found, skipping deletion.")
+        else:
+            logger.error(f"Error during delete_message_after_delay for message {message_id} in chat {chat_id}: {e}")
 
 async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, delay: int = 10):
     """Send a message that will be automatically deleted after delay"""
@@ -72,6 +95,7 @@ async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT
     # Schedule this message for deletion
     asyncio.create_task(delete_message_after_delay(update.effective_chat.id, message.message_id, context, delay))
     return message
+# --- End Enhanced Auto-delete Functionality ---
 
 # Database Functions
 def db_connect():
@@ -86,7 +110,7 @@ def setup_database():
     if not conn:
         logger.error("Failed to connect to database during setup")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("CREATE TABLE IF NOT EXISTS blacklist (id SERIAL PRIMARY KEY, word TEXT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         cur.execute("CREATE TABLE IF NOT EXISTS allowed_chats (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -118,7 +142,7 @@ def load_blacklist():
     if not conn:
         logger.error("Failed to load blacklist from database")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("SELECT word FROM blacklist")
         blacklist_words = {row[0].lower() for row in cur.fetchall()}
@@ -141,7 +165,7 @@ def load_allowed_chats():
     if not conn:
         logger.error("Failed to load allowed chats from database")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("SELECT chat_id FROM allowed_chats")
         allowed_chats = {row[0] for row in cur.fetchall()}
@@ -154,7 +178,7 @@ def load_forward_whitelist():
     if not conn:
         logger.error("Failed to load forward whitelist from database")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("SELECT user_id FROM forward_whitelist")
         forward_whitelist_users = {row[0] for row in cur.fetchall()}
@@ -184,7 +208,7 @@ async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not conn:
         await update.message.reply_text("❌ Database connection error")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("SELECT response FROM custom_commands WHERE command = %s", (command,))
         result = cur.fetchone()
@@ -210,7 +234,7 @@ async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not conn:
         await update.message.reply_text("❌ Database connection error")
         return
-        
+
     with conn.cursor() as cur:
         try:
             cur.execute("INSERT INTO custom_commands (command, response, added_by) VALUES (%s, %s, %s)", (command, response, update.effective_user.id))
@@ -229,7 +253,7 @@ async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not conn:
         await update.message.reply_text("❌ Database connection error")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("INSERT INTO reported_spam (message, reported_by) VALUES (%s, %s)", (spam_message, update.effective_user.id))
     conn.commit()
@@ -250,7 +274,7 @@ async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not conn:
             await update.message.reply_text("❌ Database connection error")
             return
-            
+
         with conn.cursor() as cur:
             cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
         conn.commit()
@@ -270,7 +294,7 @@ async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not conn:
         await update.message.reply_text("❌ Database connection error")
         return
-        
+
     with conn.cursor() as cur:
         cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
     conn.commit()
@@ -315,7 +339,7 @@ async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not conn:
             await update.message.reply_text("❌ Database connection error")
             return
-            
+
         with conn.cursor() as cur:
             cur.execute("INSERT INTO forward_whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_to_allow.id, update.effective_user.id))
         conn.commit()
@@ -340,13 +364,13 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await send_auto_delete_message(update, context, "Usage: Reply to a user's message or use /revokeforward <user_id>", 10)
         return
-        
+
     if user_id_to_revoke:
         conn = db_connect()
         if not conn:
             await update.message.reply_text("❌ Database connection error")
             return
-            
+
         with conn.cursor() as cur:
             cur.execute("DELETE FROM forward_whitelist WHERE user_id = %s", (user_id_to_revoke,))
         conn.commit()
@@ -361,7 +385,7 @@ async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not forward_whitelist_users:
         await update.message.reply_text("No users are currently allowed to forward messages.")
         return
-    
+
     users_list = "\n".join(str(user_id) for user_id in forward_whitelist_users)
     await update.message.reply_text(f"Users allowed to forward:\n{users_list}")
 
@@ -379,7 +403,7 @@ async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not conn:
             await update.message.reply_text("❌ Database connection error")
             return
-            
+
         with conn.cursor() as cur:
             cur.execute("INSERT INTO allowed_channels (channel_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (channel_id, update.effective_user.id))
         conn.commit()
@@ -393,7 +417,7 @@ async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors in the telegram bot."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    
+
     # Try to notify the user about the error if possible
     if update and update.effective_message:
         try:
@@ -434,7 +458,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /allowchannel <channel_id> - Allow a channel to post without restrictions
     /stats - Show protection statistics
     /botversion - Check bot version
-    
+
     👥 *User Commands:*
     /report - Reply to a spam message to report it
     """
@@ -452,7 +476,7 @@ async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not conn:
         await update.message.reply_text("❌ Database connection error")
         return
-        
+
     with conn.cursor() as cur:
         added_count = 0
         for word in words_to_add:
@@ -472,7 +496,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     stats_text = f"""
     📊 *Guardian Bot Statistics*
-    
+
     • Blacklisted words: {len(blacklist_words)}
     • Allowed chats: {len(allowed_chats)}
     • Allowed forwarders: {len(forward_whitelist_users)}
@@ -487,14 +511,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.channel_post and update.channel_post.chat.id == CHANNEL_ID:
         logger.info(f"Allowed channel post from {CHANNEL_ID}")
         return
-        
-    if not update.message or not update.message.from_user: 
+
+    if not update.message or not update.message.from_user:
         return
-    
+
     user = update.message.from_user
     chat_id = update.effective_chat.id
     message = update.message
-    
+
     # Check if message is from any bot and schedule for deletion
     if user.is_bot:
         # Schedule deletion after 10 seconds for all bot messages
@@ -503,35 +527,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         # Skip further processing for bot messages
         return
-    
+
     # Rate limiting
     current_time = time.time()
     user_key = f"{user.id}_{chat_id}"
     if user_key in message_rate_limit and current_time - message_rate_limit[user_key] < 2:
         return
     message_rate_limit[user_key] = current_time
-    
+
     # Check if this is a forwarded message from your channel
     if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
         logger.info(f"Allowed forwarded message from channel {CHANNEL_ID}")
         return
-        
-    if chat_id not in allowed_chats: 
+
+    if chat_id not in allowed_chats:
         return
-    
+
     now = datetime.now()
     if user.id in user_last_message and (now - user_last_message[user.id]).seconds < 2:
-        try: 
+        try:
             await message.delete()
         except Exception as e:
             if "message to delete not found" not in str(e).lower():
                 logger.error(f"Failed to delete message: {e}")
         return
     user_last_message[user.id] = now
-    
+
     is_admin = False
     if chat_id > 0:
-        if str(user.id) == str(ADMIN_USER_ID): 
+        if str(user.id) == str(ADMIN_USER_ID):
             is_admin = True
     else:
         try:
@@ -540,12 +564,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_admin = True
         except Exception as e:
             logger.error(f"Error checking user status: {e}")
-            if str(user.id) == str(ADMIN_USER_ID): 
+            if str(user.id) == str(ADMIN_USER_ID):
                 is_admin = True
-    
-    if is_admin: 
+
+    if is_admin:
         return
-            
+
     text = message.text or message.caption or ""
     text_lower = text.lower()
     normalized_text = normalize_text(text)
@@ -558,27 +582,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (message.forward_from or message.forward_from_chat) and (user.id not in forward_whitelist_users):
         is_spam, reason = True, "You do not have permission to forward messages"
 
-    if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []): 
+    if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []):
         is_spam, reason = True, "Links are not allowed"
-    if not is_spam and contains_hidden_links(text): 
+    if not is_spam and contains_hidden_links(text):
         is_spam, reason = True, "Hidden links detected"
-    if not is_spam and '@' in text and not text.startswith('/'): 
+    if not is_spam and '@' in text and not text.startswith('/'):
         is_spam, reason = True, "Mentions are not allowed"
-    if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)): 
+    if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)):
         is_spam, reason = True, "Blacklisted word detected"
-    if not is_spam and any(term in text_lower for term in payment_terms): 
+    if not is_spam and any(term in text_lower for term in payment_terms):
         is_spam, reason = True, "Payment terms detected"
     if not is_spam:
         pattern_detected, pattern_reason = detect_spam_patterns(text_lower)
-        if pattern_detected: 
+        if pattern_detected:
             is_spam, reason = True, pattern_reason
-        
+
     if not is_spam and text:
         try:
             analysis_text = f"Original: {text}\nNormalized: {normalized_text}"
             response = await asyncio.wait_for(spam_model.generate_content_async(analysis_text), timeout=7.0)
             logger.info(f"AI Response: {response.text}")
-            if "SPAM" in response.text.upper(): 
+            if "SPAM" in response.text.upper():
                 is_spam, reason = True, "AI detected spam content"
         except asyncio.TimeoutError:
             logger.warning("Gemini AI timeout, skipping analysis")
@@ -613,7 +637,7 @@ def main():
     load_blacklist()
     load_allowed_chats()
     load_forward_whitelist()
-    
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Add error handler
@@ -633,11 +657,11 @@ def main():
     application.add_handler(CommandHandler("revokeforward", revokeforward))
     application.add_handler(CommandHandler("listforwarders", listforwarders))
     application.add_handler(CommandHandler("botversion", botversion))
-    application.add_handler(CommandHandler("allowchannel", allowchannel))  # New command
-    
+    application.add_handler(CommandHandler("allowchannel", allowchannel)) # New command
+
     command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
-    
+
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info("🛡️ Guardian Bot is now running with enhanced detection...")
