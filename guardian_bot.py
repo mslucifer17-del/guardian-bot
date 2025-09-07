@@ -3,6 +3,7 @@ import threading
 import asyncio
 import re
 import logging
+import time
 from flask import Flask
 import google.generativeai as genai
 from telegram import Update
@@ -42,6 +43,7 @@ user_last_message = defaultdict(datetime)
 blacklist_words = set()
 allowed_chats = set()
 forward_whitelist_users = set()
+message_rate_limit = {}
 
 # Advanced spam patterns
 spam_patterns = [
@@ -55,10 +57,18 @@ payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", 
 
 # Database Functions
 def db_connect():
-    return psycopg2.connect(DATABASE_URL)
+    try:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=5)
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        return None
 
 def setup_database():
     conn = db_connect()
+    if not conn:
+        logger.error("Failed to connect to database during setup")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("CREATE TABLE IF NOT EXISTS blacklist (id SERIAL PRIMARY KEY, word TEXT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         cur.execute("CREATE TABLE IF NOT EXISTS allowed_chats (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
@@ -87,6 +97,10 @@ def setup_database():
 def load_blacklist():
     global blacklist_words
     conn = db_connect()
+    if not conn:
+        logger.error("Failed to load blacklist from database")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("SELECT word FROM blacklist")
         blacklist_words = {row[0].lower() for row in cur.fetchall()}
@@ -95,15 +109,21 @@ def load_blacklist():
         if word not in blacklist_words:
             try:
                 with db_connect() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word, ADMIN_USER_ID))
-                        conn.commit()
-            except: pass
+                    if conn:
+                        with conn.cursor() as cur:
+                            cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word, ADMIN_USER_ID))
+                            conn.commit()
+            except Exception as e:
+                logger.error(f"Error adding critical word {word}: {e}")
     logger.info(f"Loaded {len(blacklist_words)} words from blacklist")
 
 def load_allowed_chats():
     global allowed_chats
     conn = db_connect()
+    if not conn:
+        logger.error("Failed to load allowed chats from database")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("SELECT chat_id FROM allowed_chats")
         allowed_chats = {row[0] for row in cur.fetchall()}
@@ -113,6 +133,10 @@ def load_allowed_chats():
 def load_forward_whitelist():
     global forward_whitelist_users
     conn = db_connect()
+    if not conn:
+        logger.error("Failed to load forward whitelist from database")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("SELECT user_id FROM forward_whitelist")
         forward_whitelist_users = {row[0] for row in cur.fetchall()}
@@ -139,6 +163,10 @@ def normalize_text(text):
 async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command = update.message.text.split()[0][1:].lower()
     conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("SELECT response FROM custom_commands WHERE command = %s", (command,))
         result = cur.fetchone()
@@ -161,6 +189,10 @@ async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command = context.args[0].lower()
     response = " ".join(context.args[1:])
     conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
     with conn.cursor() as cur:
         try:
             cur.execute("INSERT INTO custom_commands (command, response, added_by) VALUES (%s, %s, %s)", (command, response, update.effective_user.id))
@@ -176,6 +208,10 @@ async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     spam_message = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
     conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("INSERT INTO reported_spam (message, reported_by) VALUES (%s, %s)", (spam_message, update.effective_user.id))
     conn.commit()
@@ -193,6 +229,10 @@ async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = int(context.args[0])
         conn = db_connect()
+        if not conn:
+            await update.message.reply_text("❌ Database connection error")
+            return
+            
         with conn.cursor() as cur:
             cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
         conn.commit()
@@ -209,6 +249,10 @@ async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
     with conn.cursor() as cur:
         cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
     conn.commit()
@@ -250,6 +294,10 @@ async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_to_allow:
         conn = db_connect()
+        if not conn:
+            await update.message.reply_text("❌ Database connection error")
+            return
+            
         with conn.cursor() as cur:
             cur.execute("INSERT INTO forward_whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_to_allow.id, update.effective_user.id))
         conn.commit()
@@ -277,6 +325,10 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     if user_id_to_revoke:
         conn = db_connect()
+        if not conn:
+            await update.message.reply_text("❌ Database connection error")
+            return
+            
         with conn.cursor() as cur:
             cur.execute("DELETE FROM forward_whitelist WHERE user_id = %s", (user_id_to_revoke,))
         conn.commit()
@@ -306,6 +358,10 @@ async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         channel_id = int(context.args[0])
         conn = db_connect()
+        if not conn:
+            await update.message.reply_text("❌ Database connection error")
+            return
+            
         with conn.cursor() as cur:
             cur.execute("INSERT INTO allowed_channels (channel_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (channel_id, update.effective_user.id))
         conn.commit()
@@ -360,6 +416,10 @@ async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /addword <word1> <word2>...")
         return
     conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
     with conn.cursor() as cur:
         added_count = 0
         for word in words_to_add:
@@ -390,32 +450,40 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Message handling with advanced protection
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Check if this is a channel post from your channel
+    if update.channel_post and update.channel_post.chat.id == CHANNEL_ID:
+        logger.info(f"Allowed channel post from {CHANNEL_ID}")
+        return
+        
     if not update.message or not update.message.from_user: 
-        # Check if this is a channel post
-        if update.channel_post:
-            # Allow all channel posts from your channel
-            if update.channel_post.chat.id == CHANNEL_ID:
-                logger.info(f"Allowed channel post from {CHANNEL_ID}")
-                return
         return
     
     user = update.message.from_user
     chat_id = update.effective_chat.id
     message = update.message
     
+    # Rate limiting
+    current_time = time.time()
+    user_key = f"{user.id}_{chat_id}"
+    if user_key in message_rate_limit and current_time - message_rate_limit[user_key] < 2:
+        return
+    message_rate_limit[user_key] = current_time
+    
+    # Check if this is a forwarded message from your channel
+    if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
+        logger.info(f"Allowed forwarded message from channel {CHANNEL_ID}")
+        return
+        
     if chat_id not in allowed_chats: 
-        # Check if this is a forwarded message from your channel
-        if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
-            logger.info(f"Allowed forwarded message from channel {CHANNEL_ID}")
-            return
         return
     
     now = datetime.now()
     if user.id in user_last_message and (now - user_last_message[user.id]).seconds < 2:
         try: 
             await message.delete()
-        except: 
-            pass
+        except Exception as e:
+            if "message to delete not found" not in str(e).lower():
+                logger.error(f"Failed to delete message: {e}")
         return
     user_last_message[user.id] = now
     
@@ -425,16 +493,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_admin = True
     else:
         try:
-            chat_admins = await context.bot.get_chat_administrators(chat_id)
-            admin_ids = {admin.user.id for admin in chat_admins}
-            # Allow channel posts and forwarded messages from your channel
-            if (user.id in admin_ids or 
-                str(user.id) == str(ADMIN_USER_ID) or 
-                user.id == 136817688 or  # Your channel poster ID
-                (message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID)):
+            chat_member = await context.bot.get_chat_member(chat_id, user.id)
+            if chat_member.status in ['administrator', 'creator']:
                 is_admin = True
         except Exception as e:
-            logger.error(f"Error checking admin status: {e}")
+            logger.error(f"Error checking user status: {e}")
             if str(user.id) == str(ADMIN_USER_ID): 
                 is_admin = True
     
@@ -448,11 +511,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reason = ""
 
     logger.info(f"Message from {user.id}: {text[:100]}...")
-
-    # Skip spam checks for messages from your channel
-    if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
-        logger.info(f"Skipping spam check for message from channel {CHANNEL_ID}")
-        return
 
     # Strict Rules
     if (message.forward_from or message.forward_from_chat) and (user.id not in forward_whitelist_users):
@@ -480,6 +538,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"AI Response: {response.text}")
             if "SPAM" in response.text.upper(): 
                 is_spam, reason = True, "AI detected spam content"
+        except asyncio.TimeoutError:
+            logger.warning("Gemini AI timeout, skipping analysis")
         except Exception as e:
             logger.error(f"Gemini error: {e}")
 
@@ -497,7 +557,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3", parse_mode='HTML')
                 logger.info(f"Spam detected from user {user.id}: {reason}")
         except Exception as e:
-            logger.error(f"Action error: {e}")
+            if "message to delete not found" not in str(e).lower():
+                logger.error(f"Action error: {e}")
 
 def main():
     setup_database()
