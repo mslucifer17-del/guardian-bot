@@ -371,6 +371,21 @@ async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid channel ID. Must be a number.")
 
+# Error handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors in the telegram bot."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    
+    # Try to notify the user about the error if possible
+    if update and update.effective_message:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Sorry, an error occurred while processing your request. Please try again later."
+            )
+        except Exception as e:
+            logger.error(f"Error while sending error message: {e}")
+
 # Flask App for Keep-Alive
 flask_app = Flask(__name__)
 @flask_app.route('/')
@@ -567,6 +582,9 @@ def main():
     load_forward_whitelist()
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add error handler
+    application.add_error_handler(error_handler)
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
