@@ -53,7 +53,7 @@ spam_patterns = [
     r"combo no\d", r"latest updated", r"desi cp", r"indian cp", r"foreign cp",
     r"tamil cp", r"chinese cp", r"arabians cp", r"bro-sis cp", r"dad-daughter cp",
     r"pedo mom-son cp", r"premium cp", r"content collection", r"price available",
-    r"payment method", r"upi|paypal|crypto|gift card"
+    r"payment method", r"upi|paypal|crypto|gift card, r"nude, r"Service availale, r"video call"
 ]
 payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
 
