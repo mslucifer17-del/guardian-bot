@@ -50,10 +50,10 @@ dynamic_commands = {}  # Store for dynamic commands
 # Advanced spam patterns
 spam_patterns = [
     r"lowest price", r"premium collection", r"dm for purchase", r"payment method",
-    r"combo no\d", r"latest updated", r"desi cp", r"indian cp", r"foreign cp",
-    r"tamil cp", r"chinese cp", r"arabians cp", r"bro-sis cp", r"dad-daughter cp",
+    r"combo novd", r"latest updated", r"desi cp", r"indian cp", r"foreign cp",
+    r"tamil cp", r"Chinese cp", r"arabians cp", r"bro-sis cp", r"dad-daughter cp",
     r"pedo mom-son cp", r"premium cp", r"content collection", r"price available",
-    r"payment method", r"upi|paypal|crypto|gift card, r"nude, r"Service availale, r"video call"
+    r"upi|paypal|crypto|gift card", r"nude", r"Service available", r"video call"
 ]
 payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
 
