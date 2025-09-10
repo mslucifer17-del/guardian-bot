@@ -10,12 +10,13 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from collections import defaultdict
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0").strip())
+ADMIN_USER_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_USER_IDS", "").split(",") if id.strip()]
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get('PORT', 8080))
 # Add your channel ID here
@@ -44,6 +45,7 @@ blacklist_words = set()
 allowed_chats = set()
 forward_whitelist_users = set()
 message_rate_limit = {}
+dynamic_commands = {}  # Store for dynamic commands
 
 # Advanced spam patterns
 spam_patterns = [
@@ -109,6 +111,17 @@ def setup_database():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Add table for dynamic commands with actions
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS dynamic_commands (
+                id SERIAL PRIMARY KEY,
+                command TEXT NOT NULL UNIQUE,
+                action_type TEXT NOT NULL,
+                parameters JSONB,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
     conn.commit()
     conn.close()
 
@@ -129,7 +142,7 @@ def load_blacklist():
                 with db_connect() as conn:
                     if conn:
                         with conn.cursor() as cur:
-                            cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word, ADMIN_USER_ID))
+                            cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word, ADMIN_USER_IDS[0] if ADMIN_USER_IDS else 0))
                             conn.commit()
             except Exception as e:
                 logger.error(f"Error adding critical word {word}: {e}")
@@ -161,6 +174,19 @@ def load_forward_whitelist():
     conn.close()
     logger.info(f"Loaded {len(forward_whitelist_users)} users from forward whitelist")
 
+def load_dynamic_commands():
+    global dynamic_commands
+    conn = db_connect()
+    if not conn:
+        logger.error("Failed to load dynamic commands from database")
+        return
+        
+    with conn.cursor() as cur:
+        cur.execute("SELECT command, action_type, parameters FROM dynamic_commands")
+        dynamic_commands = {row[0]: {'action_type': row[1], 'parameters': row[2]} for row in cur.fetchall()}
+    conn.close()
+    logger.info(f"Loaded {len(dynamic_commands)} dynamic commands")
+
 # Advanced detection functions
 def contains_hidden_links(text):
     patterns = [r'[🟢💰📣⬇️➖➗]+\s*[\w\s]+\s*[🟢💰📣⬇️➖➗]+', r'[\w\.-]+\.[a-zA-Z]{2,}', r'@[\w]+\s*[\w]*\s*(offer|deal|price|sale)', r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+']
@@ -177,6 +203,10 @@ def normalize_text(text):
     normalized = re.sub(r'\s+', ' ', normalized).strip().lower()
     return normalized
 
+# Admin check function
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
 # Custom command system
 async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command = update.message.text.split()[0][1:].lower()
@@ -192,14 +222,58 @@ async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TY
     if result:
         await update.message.reply_text(result[0])
 
+# Dynamic command system
+async def handle_dynamic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command = update.message.text.split()[0][1:].lower()
+    
+    if command in dynamic_commands:
+        cmd_data = dynamic_commands[command]
+        action_type = cmd_data['action_type']
+        parameters = cmd_data['parameters'] or {}
+        
+        try:
+            if action_type == "reply":
+                await update.message.reply_text(parameters.get('text', 'No text specified'))
+            elif action_type == "restrict_user":
+                if await is_admin(update.effective_user.id):
+                    user_id = parameters.get('user_id')
+                    if user_id:
+                        await context.bot.restrict_chat_member(
+                            chat_id=update.effective_chat.id,
+                            user_id=user_id,
+                            permissions={
+                                'can_send_messages': False,
+                                'can_send_media_messages': False,
+                                'can_send_other_messages': False,
+                                'can_add_web_page_previews': False
+                            }
+                        )
+                        await update.message.reply_text(f"✅ User {user_id} has been restricted.")
+                    else:
+                        await update.message.reply_text("❌ No user ID specified in command parameters.")
+                else:
+                    await send_auto_delete_message(update, context, "❌ Only admins can use this command.", 10)
+            elif action_type == "delete_message":
+                if update.message.reply_to_message:
+                    try:
+                        await update.message.reply_to_message.delete()
+                        await update.message.delete()
+                    except Exception as e:
+                        await update.message.reply_text(f"❌ Could not delete message: {e}")
+                else:
+                    await update.message.reply_text("❌ Please reply to a message to delete it.")
+            # Add more action types as needed
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error executing command: {str(e)}")
+
 # Admin commands
 async def botversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) == str(ADMIN_USER_ID):
-        await update.message.reply_text("✅ Guardian Bot v2.1 - Channel Post Fix Applied.")
+    if await is_admin(update.effective_user.id):
+        await update.message.reply_text("✅ Guardian Bot v2.1 - Dynamic Commands Added")
 
 async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await send_auto_delete_message(update, context, "❌ Only admin can add commands", 10)
+    if not await is_admin(update.effective_user.id):
+        await send_auto_delete_message(update, context, "❌ Only admins can add commands", 10)
         return
     if len(context.args) < 2:
         await send_auto_delete_message(update, context, "Usage: /addcommand <name> <response>", 10)
@@ -220,6 +294,74 @@ async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Command /{command} already exists")
     conn.close()
 
+async def add_dynamic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        await send_auto_delete_message(update, context, "❌ Only admins can add dynamic commands", 10)
+        return
+    
+    if len(context.args) < 3:
+        await send_auto_delete_message(update, context, "Usage: /adddynamic <command> <action_type> <json_parameters>", 10)
+        return
+    
+    command = context.args[0].lower()
+    action_type = context.args[1].lower()
+    try:
+        parameters = json.loads(" ".join(context.args[2:]))
+    except json.JSONDecodeError:
+        await send_auto_delete_message(update, context, "❌ Invalid JSON parameters", 10)
+        return
+    
+    conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "INSERT INTO dynamic_commands (command, action_type, parameters, added_by) VALUES (%s, %s, %s, %s)",
+                (command, action_type, json.dumps(parameters), update.effective_user.id)
+            )
+            conn.commit()
+            load_dynamic_commands()  # Reload dynamic commands
+            await update.message.reply_text(f"✅ Dynamic command /{command} added successfully!")
+        except psycopg2.IntegrityError:
+            await update.message.reply_text(f"❌ Command /{command} already exists")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error adding command: {str(e)}")
+    conn.close()
+
+async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        await send_auto_delete_message(update, context, "❌ Only admins can view commands", 10)
+        return
+    
+    conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+    
+    # Get custom commands
+    with conn.cursor() as cur:
+        cur.execute("SELECT command, response FROM custom_commands")
+        custom_commands = cur.fetchall()
+        
+        cur.execute("SELECT command, action_type FROM dynamic_commands")
+        dynamic_commands_list = cur.fetchall()
+    
+    conn.close()
+    
+    response = "📋 Available Commands:\n\n"
+    response += "🔹 Custom Commands:\n"
+    for cmd, resp in custom_commands:
+        response += f"/{cmd} - {resp[:50]}...\n"
+    
+    response += "\n🔹 Dynamic Commands:\n"
+    for cmd, action_type in dynamic_commands_list:
+        response += f"/{cmd} - {action_type}\n"
+    
+    await update.message.reply_text(response)
+
 async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
         await send_auto_delete_message(update, context, "❌ Please reply to a spam message to report it.", 10)
@@ -238,8 +380,8 @@ async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Spam reported by user {update.effective_user.id}: {spam_message[:50]}...")
 
 async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
-        await send_auto_delete_message(update, context, f"❌ Only admin can allow chats (Your ID: {update.effective_user.id}, Admin ID: {ADMIN_USER_ID})", 10)
+    if not await is_admin(update.effective_user.id):
+        await send_auto_delete_message(update, context, f"❌ Only admins can allow chats (Your ID: {update.effective_user.id})", 10)
         return
     if not context.args:
         await send_auto_delete_message(update, context, "Usage: /allowchat <chat_id>", 10)
@@ -262,7 +404,7 @@ async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_auto_delete_message(update, context, "❌ Invalid chat ID. Must be a number.", 10)
 
 async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
         return
     chat_id = update.effective_chat.id
@@ -279,7 +421,7 @@ async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Okay! I will now be active in this chat (ID: {chat_id}).")
 
 async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can view allowed chats", 10)
         return
     if not allowed_chats:
@@ -289,7 +431,7 @@ async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Allowed chats:\n{chats_list}")
 
 async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
         return
 
@@ -324,7 +466,7 @@ async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ User {user_to_allow.first_name} ({user_to_allow.id}) can now forward messages.")
 
 async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
         return
 
@@ -355,7 +497,7 @@ async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ User {user_id_to_revoke} can no longer forward messages.")
 
 async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can view this list.", 10)
         return
     if not forward_whitelist_users:
@@ -367,7 +509,7 @@ async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # New function to allow channels
 async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can allow channels", 10)
         return
     if not context.args:
@@ -418,13 +560,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛡️ Hello! I'm Guardian Bot\n\nI protect groups from spam and scams with AI-powered detection.\nUse /help to see available commands.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can use this command", 10)
         return
     help_text = """
     🛡️ *Admin Commands:*
     /addword <words> - Add words to blacklist
-    /addcommand <name> <response> - Add custom command
+    /addcommand <name> <response> - Add custom text command
+    /adddynamic <command> <action_type> <json_parameters> - Add dynamic command with action
+    /listcommands - List all custom commands
     /allowchat <chat_id> - Allow a chat by ID
     /allowthischat - Allow the current chat
     /listchats - List allowed chats
@@ -441,7 +585,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can add words", 10)
         return
     words_to_add = {word.lower() for word in context.args}
@@ -467,7 +611,7 @@ async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Added {added_count} word(s) to blacklist")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_USER_ID):
+    if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can view stats", 10)
         return
     stats_text = f"""
@@ -478,6 +622,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     • Allowed forwarders: {len(forward_whitelist_users)}
     • Active warnings: {len(user_warnings)}
     • AI Model: Gemini 1.5 Flash
+    • Dynamic commands: {len(dynamic_commands)}
     """
     await update.message.reply_text(stats_text, parse_mode='Markdown')
 
@@ -529,21 +674,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_last_message[user.id] = now
     
-    is_admin = False
-    if chat_id > 0:
-        if str(user.id) == str(ADMIN_USER_ID): 
-            is_admin = True
-    else:
-        try:
-            chat_member = await context.bot.get_chat_member(chat_id, user.id)
-            if chat_member.status in ['administrator', 'creator']:
-                is_admin = True
-        except Exception as e:
-            logger.error(f"Error checking user status: {e}")
-            if str(user.id) == str(ADMIN_USER_ID): 
-                is_admin = True
+    is_admin_user = await is_admin(user.id)
+    if not is_admin_user and chat_id > 0:
+        # For private chats, check if user is the admin
+        if user.id in ADMIN_USER_IDS:
+            is_admin_user = True
     
-    if is_admin: 
+    if is_admin_user: 
         return
             
     text = message.text or message.caption or ""
@@ -613,6 +750,7 @@ def main():
     load_blacklist()
     load_allowed_chats()
     load_forward_whitelist()
+    load_dynamic_commands()
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -624,6 +762,8 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addword", addword))
     application.add_handler(CommandHandler("addcommand", addcommand))
+    application.add_handler(CommandHandler("adddynamic", add_dynamic_command))
+    application.add_handler(CommandHandler("listcommands", list_commands))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("report", report_spam))
     application.add_handler(CommandHandler("allowchat", allowchat))
@@ -633,14 +773,18 @@ def main():
     application.add_handler(CommandHandler("revokeforward", revokeforward))
     application.add_handler(CommandHandler("listforwarders", listforwarders))
     application.add_handler(CommandHandler("botversion", botversion))
-    application.add_handler(CommandHandler("allowchannel", allowchannel))  # New command
+    application.add_handler(CommandHandler("allowchannel", allowchannel))
     
-    command_list = r'^/(start|help|addword|addcommand|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
+    # Handle custom commands
+    command_list = r'^/(start|help|addword|addcommand|adddynamic|listcommands|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
+    
+    # Handle dynamic commands
+    application.add_handler(MessageHandler(filters.COMMAND, handle_dynamic_command))
     
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    logger.info("🛡️ Guardian Bot is now running with enhanced detection...")
+    logger.info("🛡️ Guardian Bot is now running with dynamic commands...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
