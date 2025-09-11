@@ -66,8 +66,19 @@ async def delete_message_after_delay(chat_id: int, message_id: int, context: Con
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception as e:
-        # Message might have already been deleted or bot doesn't have permissions
-        if "message to delete not found" not in str(e).lower():
+        error_msg = str(e).lower()
+        # Check for various error conditions
+        if "message to delete not found" in error_msg:
+            # Message was already deleted, no need to log as error
+            logger.debug(f"Message {message_id} in chat {chat_id} was already deleted")
+        elif "timed out" in error_msg:
+            # Network timeout, log as warning instead of error
+            logger.warning(f"Timeout when deleting message {message_id} in chat {chat_id}")
+        elif "not enough rights" in error_msg:
+            # Bot doesn't have permission to delete messages
+            logger.warning(f"Bot doesn't have permission to delete messages in chat {chat_id}")
+        else:
+            # Other unexpected errors
             logger.error(f"Could not delete message {message_id} in chat {chat_id}: {e}")
 
 async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, delay: int = 10):
