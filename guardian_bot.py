@@ -22,6 +22,7 @@ PORT = int(os.environ.get('PORT', 8080))
 # Add your channel ID here
 CHANNEL_ID = -1002533091260  # Replace with your actual channel ID
 PROMOTION_TEXT = "For promotions, join: https://t.me/ThePromotionHubIndia"
+MAX_WARNINGS = int(os.environ.get("MAX_WARNINGS", 5))  # Configurable warning threshold
 
 # Setup logging
 logging.basicConfig(
@@ -124,6 +125,15 @@ def setup_database():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Add table for bot settings
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                id SERIAL PRIMARY KEY,
+                setting_key TEXT NOT NULL UNIQUE,
+                setting_value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
     conn.commit()
     conn.close()
 
@@ -188,6 +198,42 @@ def load_dynamic_commands():
         dynamic_commands = {row[0]: {'action_type': row[1], 'parameters': row[2]} for row in cur.fetchall()}
     conn.close()
     logger.info(f"Loaded {len(dynamic_commands)} dynamic commands")
+
+def load_bot_settings():
+    global MAX_WARNINGS
+    conn = db_connect()
+    if not conn:
+        logger.error("Failed to load bot settings from database")
+        return
+        
+    with conn.cursor() as cur:
+        cur.execute("SELECT setting_key, setting_value FROM bot_settings")
+        for row in cur.fetchall():
+            if row[0] == 'max_warnings':
+                try:
+                    MAX_WARNINGS = int(row[1])
+                except ValueError:
+                    logger.error(f"Invalid value for max_warnings: {row[1]}")
+    conn.close()
+    logger.info(f"Loaded bot settings, MAX_WARNINGS = {MAX_WARNINGS}")
+
+async def update_setting(setting_key, setting_value):
+    conn = db_connect()
+    if not conn:
+        return False
+        
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_settings (setting_key, setting_value) VALUES (%s, %s) ON CONFLICT (setting_key) DO UPDATE SET setting_value = %s, updated_at = CURRENT_TIMESTAMP",
+                (setting_key, setting_value, setting_value)
+            )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error updating setting {setting_key}: {e}")
+        return False
 
 # Advanced detection functions
 def contains_hidden_links(text):
@@ -560,6 +606,32 @@ async def block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_blacklist()
     await update.message.reply_text(f"✅ Added {added_count} word(s) to blacklist")
 
+# Set max warnings command
+async def setmaxwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        await send_auto_delete_message(update, context, "❌ Only admin can change warning threshold", 10)
+        return
+    if not context.args or len(context.args) != 1:
+        await send_auto_delete_message(update, context, "Usage: /setmaxwarnings <number>", 10)
+        return
+    
+    try:
+        new_max = int(context.args[0])
+        if new_max < 1:
+            await send_auto_delete_message(update, context, "❌ Warning threshold must be at least 1", 10)
+            return
+            
+        success = await update_setting('max_warnings', str(new_max))
+        if success:
+            global MAX_WARNINGS
+            MAX_WARNINGS = new_max
+            await update.message.reply_text(f"✅ Maximum warnings before ban set to {new_max}")
+            logger.info(f"Max warnings changed to {new_max} by admin {update.effective_user.id}")
+        else:
+            await update.message.reply_text("❌ Failed to update warning threshold")
+    except ValueError:
+        await send_auto_delete_message(update, context, "❌ Please provide a valid number", 10)
+
 # Error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors in the telegram bot."""
@@ -592,7 +664,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
         await send_auto_delete_message(update, context, "❌ Only admin can use this command", 10)
         return
-    help_text = """
+    help_text = f"""
     🛡️ *Admin Commands:*
     /addword <words> - Add words to blacklist
     /block <words> - Block words (same as addword)
@@ -606,6 +678,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /revokeforward <user_id> - Revoke forward permission
     /listforwarders - List users who can forward
     /allowchannel <channel_id> - Allow a channel to post without restrictions
+    /setmaxwarnings <number> - Set max warnings before ban (Current: {MAX_WARNINGS})
     /stats - Show protection statistics
     /botversion - Check bot version
     
@@ -653,6 +726,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     • Active warnings: {len(user_warnings)}
     • AI Model: Gemini 1.5 Flash
     • Dynamic commands: {len(dynamic_commands)}
+    • Max warnings before ban: {MAX_WARNINGS}
     """
     await update.message.reply_text(stats_text, parse_mode='Markdown')
 
@@ -757,16 +831,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.delete()
             user_warnings[user.id] += 1
             warning_count = user_warnings[user.id]
-            if warning_count >= 3:
+            if warning_count >= MAX_WARNINGS:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
-                warning_msg = f"⚠️ {user.mention_html()} has been banned after 3 warnings.\n\n{PROMOTION_TEXT}"
+                warning_msg = f"⚠️ {user.mention_html()} has been banned after {MAX_WARNINGS} warnings.\n\n{PROMOTION_TEXT}"
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
                 # Schedule the warning message for deletion
                 asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
                 del user_warnings[user.id]
                 logger.info(f"User {user.id} banned for spam: {reason}")
             else:
-                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3\n\n{PROMOTION_TEXT}"
+                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/{MAX_WARNINGS}\n\n{PROMOTION_TEXT}"
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
                 # Schedule the warning message for deletion
                 asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
@@ -781,6 +855,7 @@ def main():
     load_allowed_chats()
     load_forward_whitelist()
     load_dynamic_commands()
+    load_bot_settings()
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -792,6 +867,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addword", addword))
     application.add_handler(CommandHandler("block", block))  # New block command
+    application.add_handler(CommandHandler("setmaxwarnings", setmaxwarnings))  # New setmaxwarnings command
     application.add_handler(CommandHandler("addcommand", addcommand))
     application.add_handler(CommandHandler("adddynamic", add_dynamic_command))
     application.add_handler(CommandHandler("listcommands", list_commands))
@@ -807,7 +883,7 @@ def main():
     application.add_handler(CommandHandler("allowchannel", allowchannel))
     
     # Handle custom commands
-    command_list = r'^/(start|help|addword|block|addcommand|adddynamic|listcommands|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
+    command_list = r'^/(start|help|addword|block|setmaxwarnings|addcommand|adddynamic|listcommands|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
     
     # Handle dynamic commands
@@ -815,7 +891,7 @@ def main():
     
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    logger.info("🛡️ Guardian Bot is now running with dynamic commands...")
+    logger.info(f"🛡️ Guardian Bot is now running with dynamic commands and {MAX_WARNINGS} max warnings...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
