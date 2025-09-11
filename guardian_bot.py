@@ -21,6 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get('PORT', 8080))
 # Add your channel ID here
 CHANNEL_ID = -1002533091260  # Replace with your actual channel ID
+PROMOTION_TEXT = "For promotions, join: https://t.me/ThePromotionHubIndia"
 
 # Setup logging
 logging.basicConfig(
@@ -70,7 +71,8 @@ async def delete_message_after_delay(chat_id: int, message_id: int, context: Con
 
 async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, delay: int = 10):
     """Send a message that will be automatically deleted after delay"""
-    message = await update.message.reply_text(text)
+    full_text = f"{text}\n\n{PROMOTION_TEXT}" if "promotion" not in text.lower() else text
+    message = await update.message.reply_text(full_text)
     # Schedule this message for deletion
     asyncio.create_task(delete_message_after_delay(update.effective_chat.id, message.message_id, context, delay))
     return message
@@ -531,6 +533,33 @@ async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await send_auto_delete_message(update, context, "❌ Invalid channel ID. Must be a number.", 10)
 
+# Block command to add words to blacklist
+async def block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        await send_auto_delete_message(update, context, "❌ Only admin can block words", 10)
+        return
+    words_to_add = {word.lower() for word in context.args}
+    if not words_to_add:
+        await send_auto_delete_message(update, context, "Usage: /block <word1> <word2>...", 10)
+        return
+    conn = db_connect()
+    if not conn:
+        await update.message.reply_text("❌ Database connection error")
+        return
+        
+    with conn.cursor() as cur:
+        added_count = 0
+        for word in words_to_add:
+            try:
+                cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s)",(word, update.effective_user.id))
+                added_count += 1
+            except psycopg2.IntegrityError:
+                continue
+    conn.commit()
+    conn.close()
+    load_blacklist()
+    await update.message.reply_text(f"✅ Added {added_count} word(s) to blacklist")
+
 # Error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors in the telegram bot."""
@@ -566,6 +595,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
     🛡️ *Admin Commands:*
     /addword <words> - Add words to blacklist
+    /block <words> - Block words (same as addword)
     /addcommand <name> <response> - Add custom text command
     /adddynamic <command> <action_type> <json_parameters> - Add dynamic command with action
     /listcommands - List all custom commands
@@ -729,14 +759,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warning_count = user_warnings[user.id]
             if warning_count >= 3:
                 await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
-                warning_msg = f"⚠️ {user.mention_html()} has been banned after 3 warnings."
+                warning_msg = f"⚠️ {user.mention_html()} has been banned after 3 warnings.\n\n{PROMOTION_TEXT}"
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
                 # Schedule the warning message for deletion
                 asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
                 del user_warnings[user.id]
                 logger.info(f"User {user.id} banned for spam: {reason}")
             else:
-                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3"
+                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/3\n\n{PROMOTION_TEXT}"
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
                 # Schedule the warning message for deletion
                 asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
@@ -761,6 +791,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("addword", addword))
+    application.add_handler(CommandHandler("block", block))  # New block command
     application.add_handler(CommandHandler("addcommand", addcommand))
     application.add_handler(CommandHandler("adddynamic", add_dynamic_command))
     application.add_handler(CommandHandler("listcommands", list_commands))
@@ -776,7 +807,7 @@ def main():
     application.add_handler(CommandHandler("allowchannel", allowchannel))
     
     # Handle custom commands
-    command_list = r'^/(start|help|addword|addcommand|adddynamic|listcommands|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
+    command_list = r'^/(start|help|addword|block|addcommand|adddynamic|listcommands|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
     
     # Handle dynamic commands
