@@ -903,7 +903,13 @@ def main():
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info(f"🛡️ Guardian Bot is now running with dynamic commands and {MAX_WARNINGS} max warnings...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(
+    timeout=1000,
+    pool_timeout=1000,
+    read_timeout=1000,
+    write_timeout=1000,
+    connect_timeout=1000
+)
 
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
