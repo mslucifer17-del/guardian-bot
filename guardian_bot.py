@@ -807,7 +807,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Message from {user.id}: {text[:100]}...")
 
     # Strict Rules
-    if (message.forward_from or message.forward_from_chat) and (user.id not in forward_whitelist_users):
+    if message.forward_from or message.forward_from_chat:
         is_spam, reason = True, "You do not have permission to forward messages"
 
     if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []): 
