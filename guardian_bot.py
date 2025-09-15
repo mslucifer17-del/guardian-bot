@@ -21,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get('PORT', 8080))
 # Add your channel ID here
 CHANNEL_ID = -1002533091260  # Replace with your actual channel ID
-PROMOTION_TEXT = "For promotions, join: https://t.me/ThePromotionHubIndia"
+PROMOTION_TEXT = "For promotions, join: https://t.me/+scHqQ2SR0J45NjQ1"
 MAX_WARNINGS = int(os.environ.get("MAX_WARNINGS", 5))  # Configurable warning threshold
 
 # Setup logging
