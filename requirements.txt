@@ -6,3 +6,8 @@ psycopg2-binary
 python-dotenv
 aiohttp
 asyncpg
+numpy
+requests
+redis
+psycopg2-binary
+supabase-py
