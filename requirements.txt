@@ -10,5 +10,3 @@ numpy
 requests
 redis
 psycopg2-binary
-supabase-py
-supabase
