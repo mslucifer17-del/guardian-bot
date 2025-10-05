@@ -1,917 +1,1310 @@
+"""
+Guardian Bot v3.0 - Advanced Telegram Spam Protection System
+Enhanced with modular architecture, advanced AI, and intelligent caching
+"""
+
 import os
-import threading
 import asyncio
 import re
 import logging
 import time
+import json
+import hashlib
+from typing import Optional, Dict, List, Set, Any, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from functools import lru_cache, wraps
+from contextlib import asynccontextmanager
+import threading
+from collections import defaultdict, deque
+import pickle
+
+import aiohttp
+import asyncpg
 from flask import Flask
 import google.generativeai as genai
-from telegram import Update
+from telegram import Update, Message, User
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from collections import defaultdict
-import psycopg2
-from datetime import datetime, timedelta
-import json
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
 
-# Configuration
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-ADMIN_USER_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_USER_IDS", "").split(",") if id.strip()]
-DATABASE_URL = os.environ.get("DATABASE_URL")
-PORT = int(os.environ.get('PORT', 8080))
-# Add your channel ID here
-CHANNEL_ID = -1002533091260  # Replace with your actual channel ID
-PROMOTION_TEXT = "For promotions, join: https://t.me/+scHqQ2SR0J45NjQ1"
-MAX_WARNINGS = int(os.environ.get("MAX_WARNINGS", 10))  # Configurable warning threshold
 
-# Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# AI Setup for Spam Detection
-SPAM_DETECTION_PROMPT = """You are a vigilant spam detection AI for Telegram. Analyze messages and:
-1. Reply with "SPAM" if it contains promotions, scams, ads, or suspicious links
-2. Reply with "OK" for normal messages
-3. Consider cultural context and multiple languages
-4. Pay special attention to CP (child porn), adult content, selling, and illegal activities"""
-genai.configure(api_key=GEMINI_API_KEY)
-spam_model = genai.GenerativeModel(model_name='gemini-1.5-flash', system_instruction=SPAM_DETECTION_PROMPT)
-
-# In-memory stores
-user_warnings = defaultdict(int)
-user_last_message = defaultdict(datetime)
-blacklist_words = set()
-allowed_chats = set()
-forward_whitelist_users = set()
-message_rate_limit = {}
-dynamic_commands = {}  # Store for dynamic commands
-
-# Advanced spam patterns
-spam_patterns = [
-    r"lowest price", r"premium collection", r"dm for purchase", r"payment method",
-    r"combo novd", r"latest updated", r"desi cp", r"indian cp", r"foreign cp",
-    r"tamil cp", r"Chinese cp", r"arabians cp", r"bro-sis cp", r"dad-daughter cp",
-    r"pedo mom-son cp", r"premium cp", r"content collection", r"price available",
-    r"upi|paypal|crypto|gift card", r"nude", r"Service available", r"video call"
-]
-payment_terms = ["upi", "paypal", "crypto", "gift card", "payment", "purchase", "price", "💰", "📣", "🟢"]
-
-# Auto-delete functionality for bot messages
-async def delete_message_after_delay(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE, delay: int = 10):
-    """Delete a message after a specified delay"""
-    await asyncio.sleep(delay)
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        error_msg = str(e).lower()
-        # Check for various error conditions
-        if "message to delete not found" in error_msg:
-            # Message was already deleted, no need to log as error
-            logger.debug(f"Message {message_id} in chat {chat_id} was already deleted")
-        elif "timed out" in error_msg:
-            # Network timeout, log as warning instead of error
-            logger.warning(f"Timeout when deleting message {message_id} in chat {chat_id}")
-        elif "not enough rights" in error_msg:
-            # Bot doesn't have permission to delete messages
-            logger.warning(f"Bot doesn't have permission to delete messages in chat {chat_id}")
-        else:
-            # Other unexpected errors
-            logger.error(f"Could not delete message {message_id} in chat {chat_id}: {e}")
-
-async def send_auto_delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, delay: int = 10):
-    """Send a message that will be automatically deleted after delay"""
-    full_text = f"{text}\n\n{PROMOTION_TEXT}" if "promotion" not in text.lower() else text
-    message = await update.message.reply_text(full_text)
-    # Schedule this message for deletion
-    asyncio.create_task(delete_message_after_delay(update.effective_chat.id, message.message_id, context, delay))
-    return message
-
-# Database Functions
-def db_connect():
-    try:
-        return psycopg2.connect(DATABASE_URL, connect_timeout=5)
-    except Exception as e:
-        logger.error(f"Database connection failed: {e}")
-        return None
-
-def setup_database():
-    conn = db_connect()
-    if not conn:
-        logger.error("Failed to connect to database during setup")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("CREATE TABLE IF NOT EXISTS blacklist (id SERIAL PRIMARY KEY, word TEXT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        cur.execute("CREATE TABLE IF NOT EXISTS allowed_chats (id SERIAL PRIMARY KEY, chat_id BIGINT NOT NULL UNIQUE, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        cur.execute("CREATE TABLE IF NOT EXISTS custom_commands (id SERIAL PRIMARY KEY, command TEXT NOT NULL UNIQUE, response TEXT NOT NULL, added_by BIGINT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        cur.execute("CREATE TABLE IF NOT EXISTS reported_spam (id SERIAL PRIMARY KEY, message TEXT NOT NULL, reported_by BIGINT, reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS forward_whitelist (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL UNIQUE,
-                added_by BIGINT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Add table for allowed channels
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS allowed_channels (
-                id SERIAL PRIMARY KEY,
-                channel_id BIGINT NOT NULL UNIQUE,
-                added_by BIGINT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Add table for dynamic commands with actions
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS dynamic_commands (
-                id SERIAL PRIMARY KEY,
-                command TEXT NOT NULL UNIQUE,
-                action_type TEXT NOT NULL,
-                parameters JSONB,
-                added_by BIGINT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Add table for bot settings
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                id SERIAL PRIMARY KEY,
-                setting_key TEXT NOT NULL UNIQUE,
-                setting_value TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    conn.commit()
-    conn.close()
-
-def load_blacklist():
-    global blacklist_words
-    conn = db_connect()
-    if not conn:
-        logger.error("Failed to load blacklist from database")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("SELECT word FROM blacklist")
-        blacklist_words = {row[0].lower() for row in cur.fetchall()}
-    critical_words = ["cp", "child", "porn", "premium", "collection", "price", "payment", "purchase", "desi", "indian", "foreign", "tamil", "chinese", "arabian", "bro-sis", "dad-daughter", "pedo"]
-    for word in critical_words:
-        if word not in blacklist_words:
-            try:
-                with db_connect() as conn:
-                    if conn:
-                        with conn.cursor() as cur:
-                            cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (word, ADMIN_USER_IDS[0] if ADMIN_USER_IDS else 0))
-                            conn.commit()
-            except Exception as e:
-                logger.error(f"Error adding critical word {word}: {e}")
-    logger.info(f"Loaded {len(blacklist_words)} words from blacklist")
-
-def load_allowed_chats():
-    global allowed_chats
-    conn = db_connect()
-    if not conn:
-        logger.error("Failed to load allowed chats from database")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("SELECT chat_id FROM allowed_chats")
-        allowed_chats = {row[0] for row in cur.fetchall()}
-    conn.close()
-    logger.info(f"Loaded {len(allowed_chats)} allowed chats")
-
-def load_forward_whitelist():
-    global forward_whitelist_users
-    conn = db_connect()
-    if not conn:
-        logger.error("Failed to load forward whitelist from database")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("SELECT user_id FROM forward_whitelist")
-        forward_whitelist_users = {row[0] for row in cur.fetchall()}
-    conn.close()
-    logger.info(f"Loaded {len(forward_whitelist_users)} users from forward whitelist")
-
-def load_dynamic_commands():
-    global dynamic_commands
-    conn = db_connect()
-    if not conn:
-        logger.error("Failed to load dynamic commands from database")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("SELECT command, action_type, parameters FROM dynamic_commands")
-        dynamic_commands = {row[0]: {'action_type': row[1], 'parameters': row[2]} for row in cur.fetchall()}
-    conn.close()
-    logger.info(f"Loaded {len(dynamic_commands)} dynamic commands")
-
-def load_bot_settings():
-    global MAX_WARNINGS
-    conn = db_connect()
-    if not conn:
-        logger.error("Failed to load bot settings from database")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("SELECT setting_key, setting_value FROM bot_settings")
-        for row in cur.fetchall():
-            if row[0] == 'max_warnings':
-                try:
-                    MAX_WARNINGS = int(row[1])
-                except ValueError:
-                    logger.error(f"Invalid value for max_warnings: {row[1]}")
-    conn.close()
-    logger.info(f"Loaded bot settings, MAX_WARNINGS = {MAX_WARNINGS}")
-
-async def update_setting(setting_key, setting_value):
-    conn = db_connect()
-    if not conn:
-        return False
-        
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO bot_settings (setting_key, setting_value) VALUES (%s, %s) ON CONFLICT (setting_key) DO UPDATE SET setting_value = %s, updated_at = CURRENT_TIMESTAMP",
-                (setting_key, setting_value, setting_value)
-            )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"Error updating setting {setting_key}: {e}")
-        return False
-
-# Advanced detection functions
-def contains_hidden_links(text):
-    patterns = [r'[🟢💰📣⬇️➖➗]+\s*[\w\s]+\s*[🟢💰📣⬇️➖➗]+', r'[\w\.-]+\.[a-zA-Z]{2,}', r'@[\w]+\s*[\w]*\s*(offer|deal|price|sale)', r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+']
-    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-
-def detect_spam_patterns(text):
-    for pattern in spam_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return True, f"Spam pattern detected: {pattern}"
-    return False, ""
-
-def normalize_text(text):
-    normalized = re.sub(r'[^\w\s@\.\-$]', ' ', text)
-    normalized = re.sub(r'\s+', ' ', normalized).strip().lower()
-    return normalized
-
-# Admin check function
-async def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
-
-# Custom command system
-async def handle_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command = update.message.text.split()[0][1:].lower()
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("SELECT response FROM custom_commands WHERE command = %s", (command,))
-        result = cur.fetchone()
-    conn.close()
-    if result:
-        await update.message.reply_text(result[0])
-
-# Dynamic command system
-async def handle_dynamic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command = update.message.text.split()[0][1:].lower()
+# ============= Configuration Management =============
+@dataclass
+class BotConfig:
+    """Centralized configuration management"""
+    telegram_token: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+    gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""))
+    database_url: str = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
+    admin_ids: List[int] = field(default_factory=list)
+    channel_id: int = -1002533091260
+    promotion_text: str = "For promotions, join: https://t.me/+scHqQ2SR0J45NjQ1"
+    max_warnings: int = 10
+    port: int = 8080
     
-    if command in dynamic_commands:
-        cmd_data = dynamic_commands[command]
-        action_type = cmd_data['action_type']
-        parameters = cmd_data['parameters'] or {}
+    # Advanced settings
+    ai_confidence_threshold: float = 0.75
+    rate_limit_window: int = 60  # seconds
+    rate_limit_max_messages: int = 10
+    cache_ttl: int = 300  # seconds
+    max_message_length: int = 4096
+    auto_delete_delay: int = 10
+    db_pool_min: int = 2
+    db_pool_max: int = 10
+    
+    def __post_init__(self):
+        if admin_ids_str := os.environ.get("ADMIN_USER_IDS", ""):
+            self.admin_ids = [int(id.strip()) for id in admin_ids_str.split(",") if id.strip()]
+        self.port = int(os.environ.get('PORT', 8080))
+        self.max_warnings = int(os.environ.get("MAX_WARNINGS", 10))
+
+
+# ============= Enhanced Logging =============
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors for better visibility"""
+    
+    COLORS = {
+        'DEBUG': '\033[36m',    # Cyan
+        'INFO': '\033[32m',     # Green
+        'WARNING': '\033[33m',  # Yellow
+        'ERROR': '\033[31m',    # Red
+        'CRITICAL': '\033[35m', # Magenta
+    }
+    RESET = '\033[0m'
+    
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.RESET)
+        record.levelname = f"{log_color}{record.levelname}{self.RESET}"
+        return super().format(record)
+
+
+def setup_logging():
+    """Enhanced logging setup"""
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColoredFormatter(
+        '%(asctime)s - %(levelname)s - [%(name)s] - %(message)s'
+    ))
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    
+    # Reduce noise from external libraries
+    logging.getLogger('telegram').setLevel(logging.WARNING)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__)
+
+
+# ============= Database Management =============
+class DatabasePool:
+    """Advanced database connection pool manager"""
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.pool: Optional[asyncpg.Pool] = None
+        self.logger = logging.getLogger(__name__)
         
+    async def initialize(self):
+        """Initialize connection pool"""
         try:
-            if action_type == "reply":
-                await update.message.reply_text(parameters.get('text', 'No text specified'))
-            elif action_type == "restrict_user":
-                if await is_admin(update.effective_user.id):
-                    user_id = parameters.get('user_id')
-                    if user_id:
-                        await context.bot.restrict_chat_member(
-                            chat_id=update.effective_chat.id,
-                            user_id=user_id,
-                            permissions={
-                                'can_send_messages': False,
-                                'can_send_media_messages': False,
-                                'can_send_other_messages': False,
-                                'can_add_web_page_previews': False
-                            }
-                        )
-                        await update.message.reply_text(f"✅ User {user_id} has been restricted.")
-                    else:
-                        await update.message.reply_text("❌ No user ID specified in command parameters.")
+            self.pool = await asyncpg.create_pool(
+                self.config.database_url,
+                min_size=self.config.db_pool_min,
+                max_size=self.config.db_pool_max,
+                command_timeout=10,
+                max_queries=50000,
+                max_cached_statement_lifetime=300
+            )
+            await self._setup_tables()
+            self.logger.info("Database pool initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize database pool: {e}")
+            raise
+    
+    @asynccontextmanager
+    async def acquire(self):
+        """Acquire connection from pool"""
+        async with self.pool.acquire() as connection:
+            yield connection
+    
+    async def _setup_tables(self):
+        """Setup all required database tables with optimizations"""
+        async with self.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    id SERIAL PRIMARY KEY,
+                    word TEXT NOT NULL UNIQUE,
+                    severity INTEGER DEFAULT 1,
+                    added_by BIGINT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    hit_count INTEGER DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_blacklist_word ON blacklist(word);
+                CREATE INDEX IF NOT EXISTS idx_blacklist_severity ON blacklist(severity);
+            """)
+            
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    reputation_score INTEGER DEFAULT 0,
+                    total_messages INTEGER DEFAULT 0,
+                    spam_messages INTEGER DEFAULT 0,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_trusted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_reputation ON user_profiles(reputation_score);
+            """)
+            
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS spam_patterns (
+                    id SERIAL PRIMARY KEY,
+                    pattern TEXT NOT NULL UNIQUE,
+                    pattern_type TEXT NOT NULL,
+                    confidence FLOAT DEFAULT 1.0,
+                    false_positives INTEGER DEFAULT 0,
+                    true_positives INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS message_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    message_text TEXT,
+                    is_spam BOOLEAN DEFAULT FALSE,
+                    spam_score FLOAT DEFAULT 0,
+                    detected_reason TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_history_user ON message_history(user_id);
+                CREATE INDEX IF NOT EXISTS idx_message_history_timestamp ON message_history(timestamp);
+            """)
+            
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ml_training_data (
+                    id SERIAL PRIMARY KEY,
+                    message_text TEXT NOT NULL,
+                    is_spam BOOLEAN NOT NULL,
+                    confidence FLOAT,
+                    verified BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # Keep existing tables
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_chats (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL UNIQUE,
+                    chat_name TEXT,
+                    added_by BIGINT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value JSONB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+    async def close(self):
+        """Close the connection pool"""
+        if self.pool:
+            await self.pool.close()
+
+
+# ============= Cache Management =============
+class IntelligentCache:
+    """Advanced caching system with TTL and LRU eviction"""
+    
+    def __init__(self, max_size: int = 1000, default_ttl: int = 300):
+        self.cache: Dict[str, Tuple[Any, float]] = {}
+        self.max_size = max_size
+        self.default_ttl = default_ttl
+        self.access_order = deque(maxlen=max_size)
+        self.hit_count = 0
+        self.miss_count = 0
+        self.lock = asyncio.Lock()
+    
+    async def get(self, key: str) -> Optional[Any]:
+        """Get value from cache"""
+        async with self.lock:
+            if key in self.cache:
+                value, expiry = self.cache[key]
+                if time.time() < expiry:
+                    self.hit_count += 1
+                    self.access_order.remove(key)
+                    self.access_order.append(key)
+                    return value
                 else:
-                    await send_auto_delete_message(update, context, "❌ Only admins can use this command.", 10)
-            elif action_type == "delete_message":
-                if update.message.reply_to_message:
-                    try:
-                        await update.message.reply_to_message.delete()
-                        await update.message.delete()
-                    except Exception as e:
-                        await update.message.reply_text(f"❌ Could not delete message: {e}")
-                else:
-                    await update.message.reply_text("❌ Please reply to a message to delete it.")
-            # Add more action types as needed
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error executing command: {str(e)}")
-
-# Admin commands
-async def botversion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await is_admin(update.effective_user.id):
-        await update.message.reply_text("✅ Guardian Bot v2.1 - Dynamic Commands Added")
-
-async def addcommand(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admins can add commands", 10)
-        return
-    if len(context.args) < 2:
-        await send_auto_delete_message(update, context, "Usage: /addcommand <name> <response>", 10)
-        return
-    command = context.args[0].lower()
-    response = " ".join(context.args[1:])
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-        
-    with conn.cursor() as cur:
-        try:
-            cur.execute("INSERT INTO custom_commands (command, response, added_by) VALUES (%s, %s, %s)", (command, response, update.effective_user.id))
-            conn.commit()
-            await update.message.reply_text(f"✅ Command /{command} added successfully!")
-        except psycopg2.IntegrityError:
-            await update.message.reply_text(f"❌ Command /{command} already exists")
-    conn.close()
-
-async def add_dynamic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admins can add dynamic commands", 10)
-        return
-    
-    if len(context.args) < 3:
-        await send_auto_delete_message(update, context, "Usage: /adddynamic <command> <action_type> <json_parameters>", 10)
-        return
-    
-    command = context.args[0].lower()
-    action_type = context.args[1].lower()
-    try:
-        parameters = json.loads(" ".join(context.args[2:]))
-    except json.JSONDecodeError:
-        await send_auto_delete_message(update, context, "❌ Invalid JSON parameters", 10)
-        return
-    
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-        
-    with conn.cursor() as cur:
-        try:
-            cur.execute(
-                "INSERT INTO dynamic_commands (command, action_type, parameters, added_by) VALUES (%s, %s, %s, %s)",
-                (command, action_type, json.dumps(parameters), update.effective_user.id)
-            )
-            conn.commit()
-            load_dynamic_commands()  # Reload dynamic commands
-            await update.message.reply_text(f"✅ Dynamic command /{command} added successfully!")
-        except psycopg2.IntegrityError:
-            await update.message.reply_text(f"❌ Command /{command} already exists")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error adding command: {str(e)}")
-    conn.close()
-
-async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admins can view commands", 10)
-        return
-    
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-    
-    # Get custom commands
-    with conn.cursor() as cur:
-        cur.execute("SELECT command, response FROM custom_commands")
-        custom_commands = cur.fetchall()
-        
-        cur.execute("SELECT command, action_type FROM dynamic_commands")
-        dynamic_commands_list = cur.fetchall()
-    
-    conn.close()
-    
-    response = "📋 Available Commands:\n\n"
-    response += "🔹 Custom Commands:\n"
-    for cmd, resp in custom_commands:
-        response += f"/{cmd} - {resp[:50]}...\n"
-    
-    response += "\n🔹 Dynamic Commands:\n"
-    for cmd, action_type in dynamic_commands_list:
-        response += f"/{cmd} - {action_type}\n"
-    
-    await update.message.reply_text(response)
-
-async def report_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await send_auto_delete_message(update, context, "❌ Please reply to a spam message to report it.", 10)
-        return
-    spam_message = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO reported_spam (message, reported_by) VALUES (%s, %s)", (spam_message, update.effective_user.id))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("✅ Spam reported! Thank you for helping improve our protection.")
-    logger.info(f"Spam reported by user {update.effective_user.id}: {spam_message[:50]}...")
-
-async def allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, f"❌ Only admins can allow chats (Your ID: {update.effective_user.id})", 10)
-        return
-    if not context.args:
-        await send_auto_delete_message(update, context, "Usage: /allowchat <chat_id>", 10)
-        return
-    try:
-        chat_id = int(context.args[0])
-        conn = db_connect()
-        if not conn:
-            await update.message.reply_text("❌ Database connection error")
-            return
+                    del self.cache[key]
             
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
-        conn.commit()
-        conn.close()
-        allowed_chats.add(chat_id)
-        await update.message.reply_text(f"✅ Chat {chat_id} added to allowed list")
-        logger.info(f"Chat {chat_id} allowed by admin {update.effective_user.id}")
-    except ValueError:
-        await send_auto_delete_message(update, context, "❌ Invalid chat ID. Must be a number.", 10)
-
-async def allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
-        return
-    chat_id = update.effective_chat.id
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-        
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (chat_id, update.effective_user.id))
-    conn.commit()
-    conn.close()
-    allowed_chats.add(chat_id)
-    await update.message.reply_text(f"✅ Okay! I will now be active in this chat (ID: {chat_id}).")
-
-async def listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can view allowed chats", 10)
-        return
-    if not allowed_chats:
-        await update.message.reply_text("No chats are currently allowed.")
-        return
-    chats_list = "\n".join(str(chat_id) for chat_id in allowed_chats)
-    await update.message.reply_text(f"Allowed chats:\n{chats_list}")
-
-async def allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
-        return
-
-    user_to_allow = None
-    if update.message.reply_to_message:
-        user_to_allow = update.message.reply_to_message.from_user
-    elif context.args:
-        try:
-            user_id = int(context.args[0])
-            user_to_allow = await context.bot.get_chat(user_id)
-        except (ValueError, IndexError):
-            await send_auto_delete_message(update, context, "Usage: Reply to a user or provide their User ID.", 10)
-            return
-        except Exception as e:
-            await update.message.reply_text(f"Could not find user. Error: {e}")
-            return
-    else:
-        await send_auto_delete_message(update, context, "Usage: Reply to a user's message or use /allowforward <user_id>", 10)
-        return
-
-    if user_to_allow:
-        conn = db_connect()
-        if not conn:
-            await update.message.reply_text("❌ Database connection error")
-            return
+            self.miss_count += 1
+            return None
+    
+    async def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        """Set value in cache"""
+        async with self.lock:
+            ttl = ttl or self.default_ttl
+            expiry = time.time() + ttl
             
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO forward_whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_to_allow.id, update.effective_user.id))
-        conn.commit()
-        conn.close()
-        forward_whitelist_users.add(user_to_allow.id)
-        await update.message.reply_text(f"✅ User {user_to_allow.first_name} ({user_to_allow.id}) can now forward messages.")
-
-async def revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can use this command.", 10)
-        return
-
-    user_id_to_revoke = None
-    if update.message.reply_to_message:
-        user_id_to_revoke = update.message.reply_to_message.from_user.id
-    elif context.args:
-        try:
-            user_id_to_revoke = int(context.args[0])
-        except (ValueError, IndexError):
-            await send_auto_delete_message(update, context, "Usage: Reply to a user or provide their User ID.", 10)
-            return
-    else:
-        await send_auto_delete_message(update, context, "Usage: Reply to a user's message or use /revokeforward <user_id>", 10)
-        return
-        
-    if user_id_to_revoke:
-        conn = db_connect()
-        if not conn:
-            await update.message.reply_text("❌ Database connection error")
-            return
+            if len(self.cache) >= self.max_size and key not in self.cache:
+                # LRU eviction
+                oldest = self.access_order.popleft()
+                del self.cache[oldest]
             
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM forward_whitelist WHERE user_id = %s", (user_id_to_revoke,))
-        conn.commit()
-        conn.close()
-        forward_whitelist_users.discard(user_id_to_revoke)
-        await update.message.reply_text(f"❌ User {user_id_to_revoke} can no longer forward messages.")
-
-async def listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can view this list.", 10)
-        return
-    if not forward_whitelist_users:
-        await update.message.reply_text("No users are currently allowed to forward messages.")
-        return
+            self.cache[key] = (value, expiry)
+            if key in self.access_order:
+                self.access_order.remove(key)
+            self.access_order.append(key)
     
-    users_list = "\n".join(str(user_id) for user_id in forward_whitelist_users)
-    await update.message.reply_text(f"Users allowed to forward:\n{users_list}")
+    async def clear(self):
+        """Clear all cache"""
+        async with self.lock:
+            self.cache.clear()
+            self.access_order.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        total = self.hit_count + self.miss_count
+        hit_rate = (self.hit_count / total * 100) if total > 0 else 0
+        return {
+            "hit_count": self.hit_count,
+            "miss_count": self.miss_count,
+            "hit_rate": f"{hit_rate:.2f}%",
+            "size": len(self.cache),
+            "max_size": self.max_size
+        }
 
-# New function to allow channels
-async def allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can allow channels", 10)
-        return
-    if not context.args:
-        await send_auto_delete_message(update, context, "Usage: /allowchannel <channel_id>", 10)
-        return
-    try:
-        channel_id = int(context.args[0])
-        conn = db_connect()
-        if not conn:
-            await update.message.reply_text("❌ Database connection error")
-            return
-            
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO allowed_channels (channel_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING", (channel_id, update.effective_user.id))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(f"✅ Channel {channel_id} added to allowed channels")
-        logger.info(f"Channel {channel_id} allowed by admin {update.effective_user.id}")
-    except ValueError:
-        await send_auto_delete_message(update, context, "❌ Invalid channel ID. Must be a number.", 10)
 
-# Block command to add words to blacklist
-async def block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can block words", 10)
-        return
-    words_to_add = {word.lower() for word in context.args}
-    if not words_to_add:
-        await send_auto_delete_message(update, context, "Usage: /block <word1> <word2>...", 10)
-        return
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
+# ============= AI Enhancement Layer =============
+class AdvancedAIDetector:
+    """Enhanced AI-based spam detection with multiple models"""
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
         
-    with conn.cursor() as cur:
-        added_count = 0
-        for word in words_to_add:
-            try:
-                cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s)",(word, update.effective_user.id))
-                added_count += 1
-            except psycopg2.IntegrityError:
-                continue
-    conn.commit()
-    conn.close()
-    load_blacklist()
-    await update.message.reply_text(f"✅ Added {added_count} word(s) to blacklist")
-
-# Set max warnings command
-async def setmaxwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can change warning threshold", 10)
-        return
-    if not context.args or len(context.args) != 1:
-        await send_auto_delete_message(update, context, "Usage: /setmaxwarnings <number>", 10)
-        return
-    
-    try:
-        new_max = int(context.args[0])
-        if new_max < 1:
-            await send_auto_delete_message(update, context, "❌ Warning threshold must be at least 1", 10)
-            return
-            
-        success = await update_setting('max_warnings', str(new_max))
-        if success:
-            global MAX_WARNINGS
-            MAX_WARNINGS = new_max
-            await update.message.reply_text(f"✅ Maximum warnings before ban set to {new_max}")
-            logger.info(f"Max warnings changed to {new_max} by admin {update.effective_user.id}")
-        else:
-            await update.message.reply_text("❌ Failed to update warning threshold")
-    except ValueError:
-        await send_auto_delete_message(update, context, "❌ Please provide a valid number", 10)
-
-# Error handler
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors in the telegram bot."""
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    
-    # Try to notify the user about the error if possible
-    if update and update.effective_message:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="❌ Sorry, an error occurred while processing your request. Please try again later."
-            )
-        except Exception as e:
-            logger.error(f"Error while sending error message: {e}")
-
-# Flask App for Keep-Alive
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def home():
-    return "🛡️ Guardian Bot is running and vigilant!"
-def run_flask():
-    from waitress import serve
-    serve(flask_app, host='0.0.0.0', port=PORT)
-
-# Telegram Bot Logic
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛡️ Hello! I'm Guardian Bot\n\nI protect groups from spam and scams with AI-powered detection.\nUse /help to see available commands.")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can use this command", 10)
-        return
-    help_text = f"""
-    🛡️ *Admin Commands:*
-    /addword <words> - Add words to blacklist
-    /block <words> - Block words (same as addword)
-    /addcommand <name> <response> - Add custom text command
-    /adddynamic <command> <action_type> <json_parameters> - Add dynamic command with action
-    /listcommands - List all custom commands
-    /allowchat <chat_id> - Allow a chat by ID
-    /allowthischat - Allow the current chat
-    /listchats - List allowed chats
-    /allowforward <user_id> - Allow a user to forward (reply or use ID)
-    /revokeforward <user_id> - Revoke forward permission
-    /listforwarders - List users who can forward
-    /allowchannel <channel_id> - Allow a channel to post without restrictions
-    /setmaxwarnings <number> - Set max warnings before ban (Current: {MAX_WARNINGS})
-    /stats - Show protection statistics
-    /botversion - Check bot version
-    
-    👥 *User Commands:*
-    /report - Reply to a spam message to report it
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can add words", 10)
-        return
-    words_to_add = {word.lower() for word in context.args}
-    if not words_to_add:
-        await send_auto_delete_message(update, context, "Usage: /addword <word1> <word2>...", 10)
-        return
-    conn = db_connect()
-    if not conn:
-        await update.message.reply_text("❌ Database connection error")
-        return
-        
-    with conn.cursor() as cur:
-        added_count = 0
-        for word in words_to_add:
-            try:
-                cur.execute("INSERT INTO blacklist (word, added_by) VALUES (%s, %s)",(word, update.effective_user.id))
-                added_count += 1
-            except psycopg2.IntegrityError:
-                continue
-    conn.commit()
-    conn.close()
-    load_blacklist()
-    await update.message.reply_text(f"✅ Added {added_count} word(s) to blacklist")
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        await send_auto_delete_message(update, context, "❌ Only admin can view stats", 10)
-        return
-    stats_text = f"""
-    📊 *Guardian Bot Statistics*
-    
-    • Blacklisted words: {len(blacklist_words)}
-    • Allowed chats: {len(allowed_chats)}
-    • Allowed forwarders: {len(forward_whitelist_users)}
-    • Active warnings: {len(user_warnings)}
-    • AI Model: Gemini 1.5 Flash
-    • Dynamic commands: {len(dynamic_commands)}
-    • Max warnings before ban: {MAX_WARNINGS}
-    """
-    await update.message.reply_text(stats_text, parse_mode='Markdown')
-
-# Message handling with advanced protection
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Check if this is a channel post from your channel
-    if update.channel_post and update.channel_post.chat.id == CHANNEL_ID:
-        logger.info(f"Allowed channel post from {CHANNEL_ID}")
-        return
-        
-    if not update.message or not update.message.from_user: 
-        return
-    
-    user = update.message.from_user
-    chat_id = update.effective_chat.id
-    message = update.message
-    
-    # Check if message is from any bot and schedule for deletion
-    if user.is_bot:
-        # Schedule deletion after 10 seconds for all bot messages
-        asyncio.create_task(
-            delete_message_after_delay(chat_id, message.message_id, context, 10)
+        # Initialize Gemini
+        genai.configure(api_key=config.gemini_api_key)
+        self.gemini_model = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            system_instruction=self._get_enhanced_prompt()
         )
-        # Skip further processing for bot messages
-        return
-    
-    # Rate limiting
-    current_time = time.time()
-    user_key = f"{user.id}_{chat_id}"
-    if user_key in message_rate_limit and current_time - message_rate_limit[user_key] < 2:
-        return
-    message_rate_limit[user_key] = current_time
-    
-    # Check if this is a forwarded message from your channel
-    if message.forward_from_chat and message.forward_from_chat.id == CHANNEL_ID:
-        logger.info(f"Allowed forwarded message from channel {CHANNEL_ID}")
-        return
         
-    if chat_id not in allowed_chats: 
-        return
+        # ML components
+        self.vectorizer = TfidfVectorizer(max_features=1000, ngram_range=(1, 2))
+        self.classifier = MultinomialNB()
+        self.is_trained = False
+        
+        # Pattern matching
+        self.compiled_patterns = self._compile_patterns()
+        
+    def _get_enhanced_prompt(self) -> str:
+        return """You are an advanced AI spam detection system. Analyze messages with these priorities:
+        
+        CRITICAL VIOLATIONS (immediate SPAM):
+        - Child exploitation content (CP, CSAM)
+        - Adult/sexual content sales
+        - Drug dealing or illegal substances
+        - Financial scams and frauds
+        - Phishing attempts
+        
+        HIGH RISK INDICATORS:
+        - Multiple payment methods mentioned
+        - Suspicious URLs or hidden links
+        - Excessive emojis in promotional context
+        - Urgency tactics ("limited time", "act now")
+        - Impersonation attempts
+        
+        ANALYSIS OUTPUT:
+        Return JSON: {"is_spam": boolean, "confidence": 0-1, "reason": "string", "severity": "low/medium/high/critical"}
+        
+        Consider context, language variations, and obfuscation attempts."""
     
-    now = datetime.now()
-    if user.id in user_last_message and (now - user_last_message[user.id]).seconds < 2:
-        try: 
-            await message.delete()
-        except Exception as e:
-            if "message to delete not found" not in str(e).lower():
-                logger.error(f"Failed to delete message: {e}")
-        return
-    user_last_message[user.id] = now
+    def _compile_patterns(self) -> Dict[str, List[re.Pattern]]:
+        """Compile regex patterns for efficiency"""
+        patterns = {
+            'critical': [
+                r'\b(?:child|kid|minor).*(?:porn|nude|sex)\b',
+                r'\b(?:cp|csam|pthc)\b',
+                r'\b(?:sell|buy).*(?:drug|cocaine|meth|heroin)\b'
+            ],
+            'high': [
+                r'(?:upi|paypal|crypto|bitcoin).*(?:payment|transfer)',
+                r'(?:click|visit).*(?:link|url|website).*(?:now|fast|quick)',
+                r'(?:earn|make).*(?:\$|\€|\£).*(?:day|hour|week)'
+            ],
+            'medium': [
+                r'(?:discount|offer|sale).*(?:\d+%|free)',
+                r'(?:join|subscribe).*(?:channel|group).*(?:now|today)'
+            ]
+        }
+        
+        return {
+            category: [re.compile(pattern, re.IGNORECASE) 
+                      for pattern in pattern_list]
+            for category, pattern_list in patterns.items()
+        }
     
-    is_admin_user = await is_admin(user.id)
-    if not is_admin_user and chat_id > 0:
-        # For private chats, check if user is the admin
-        if user.id in ADMIN_USER_IDS:
-            is_admin_user = True
+    async def analyze_message(
+        self, 
+        text: str, 
+        user_profile: Optional[Dict] = None,
+        context: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """Comprehensive message analysis"""
+        
+        # Quick pattern check
+        pattern_result = self._check_patterns(text)
+        if pattern_result['severity'] == 'critical':
+            return {
+                'is_spam': True,
+                'confidence': 1.0,
+                'reason': pattern_result['reason'],
+                'severity': 'critical',
+                'method': 'pattern'
+            }
+        
+        # ML classification if trained
+        ml_result = await self._ml_classify(text) if self.is_trained else None
+        
+        # Gemini analysis for complex cases
+        gemini_result = await self._gemini_analyze(text)
+        
+        # Combine results with weighted scoring
+        final_result = self._combine_results(pattern_result, ml_result, gemini_result)
+        
+        # Consider user reputation
+        if user_profile:
+            final_result = self._adjust_for_reputation(final_result, user_profile)
+        
+        return final_result
     
-    if is_admin_user: 
-        return
+    def _check_patterns(self, text: str) -> Dict[str, Any]:
+        """Check text against compiled patterns"""
+        for severity, patterns in self.compiled_patterns.items():
+            for pattern in patterns:
+                if pattern.search(text):
+                    return {
+                        'severity': severity,
+                        'reason': f'Matched {severity} risk pattern',
+                        'confidence': 0.9 if severity == 'critical' else 0.7
+                    }
+        
+        return {'severity': 'low', 'reason': None, 'confidence': 0}
+    
+    async def _ml_classify(self, text: str) -> Optional[Dict[str, Any]]:
+        """Machine learning classification"""
+        try:
+            features = self.vectorizer.transform([text])
+            prediction = self.classifier.predict(features)[0]
+            probability = self.classifier.predict_proba(features)[0].max()
             
-    text = message.text or message.caption or ""
-    text_lower = text.lower()
-    normalized_text = normalize_text(text)
-    is_spam = False
-    reason = ""
-
-    logger.info(f"Message from {user.id}: {text[:100]}...")
-
-    # Strict Rules
-    if message.forward_from or message.forward_from_chat:
-        is_spam, reason = True, "You do not have permission to forward messages"
-
-    if not is_spam and any(entity.type in ['url', 'text_link'] for entity in message.entities or []): 
-        is_spam, reason = True, "Links are not allowed"
-    if not is_spam and contains_hidden_links(text): 
-        is_spam, reason = True, "Hidden links detected"
-    if not is_spam and '@' in text and not text.startswith('/'): 
-        is_spam, reason = True, "Mentions are not allowed"
-    if not is_spam and (any(word in text_lower for word in blacklist_words) or any(word in normalized_text for word in blacklist_words)): 
-        is_spam, reason = True, "Blacklisted word detected"
-    if not is_spam and any(term in text_lower for term in payment_terms): 
-        is_spam, reason = True, "Payment terms detected"
-    if not is_spam:
-        pattern_detected, pattern_reason = detect_spam_patterns(text_lower)
-        if pattern_detected: 
-            is_spam, reason = True, pattern_reason
-        
-    if not is_spam and text:
+            return {
+                'is_spam': bool(prediction),
+                'confidence': float(probability),
+                'method': 'ml'
+            }
+        except Exception as e:
+            self.logger.error(f"ML classification error: {e}")
+            return None
+    
+    async def _gemini_analyze(self, text: str) -> Dict[str, Any]:
+        """Gemini AI analysis with timeout and error handling"""
         try:
-            analysis_text = f"Original: {text}\nNormalized: {normalized_text}"
-            response = await asyncio.wait_for(spam_model.generate_content_async(analysis_text), timeout=7.0)
-            logger.info(f"AI Response: {response.text}")
-            if "SPAM" in response.text.upper(): 
-                is_spam, reason = True, "AI detected spam content"
+            response = await asyncio.wait_for(
+                self.gemini_model.generate_content_async(
+                    f"Analyze for spam/scam:\n{text[:500]}"
+                ),
+                timeout=5.0
+            )
+            
+            # Parse JSON response
+            result_text = response.text.strip()
+            if result_text.startswith('{'):
+                return json.loads(result_text)
+            
+            # Fallback parsing
+            is_spam = 'SPAM' in result_text.upper()
+            return {
+                'is_spam': is_spam,
+                'confidence': 0.8 if is_spam else 0.2,
+                'reason': 'AI detected suspicious content' if is_spam else 'Clean',
+                'method': 'gemini'
+            }
+            
         except asyncio.TimeoutError:
-            logger.warning("Gemini AI timeout, skipping analysis")
+            self.logger.warning("Gemini timeout")
+            return {'is_spam': False, 'confidence': 0, 'method': 'timeout'}
         except Exception as e:
-            logger.error(f"Gemini error: {e}")
-
-    if is_spam:
+            self.logger.error(f"Gemini error: {e}")
+            return {'is_spam': False, 'confidence': 0, 'method': 'error'}
+    
+    def _combine_results(self, *results) -> Dict[str, Any]:
+        """Intelligently combine multiple detection results"""
+        valid_results = [r for r in results if r and r.get('confidence', 0) > 0]
+        
+        if not valid_results:
+            return {
+                'is_spam': False,
+                'confidence': 0,
+                'reason': 'No detection triggered',
+                'severity': 'low'
+            }
+        
+        # Weighted average based on method reliability
+        weights = {'pattern': 1.0, 'ml': 0.8, 'gemini': 0.9}
+        total_weight = 0
+        weighted_confidence = 0
+        
+        for result in valid_results:
+            method = result.get('method', 'unknown')
+            weight = weights.get(method, 0.5)
+            confidence = result.get('confidence', 0)
+            
+            weighted_confidence += confidence * weight
+            total_weight += weight
+        
+        final_confidence = weighted_confidence / total_weight if total_weight > 0 else 0
+        
+        # Determine if spam based on threshold
+        is_spam = final_confidence >= self.config.ai_confidence_threshold
+        
+        # Get the highest severity
+        severity_order = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
+        max_severity = 'low'
+        for result in valid_results:
+            result_severity = result.get('severity', 'low')
+            if severity_order.get(result_severity, 1) > severity_order.get(max_severity, 1):
+                max_severity = result_severity
+        
+        return {
+            'is_spam': is_spam,
+            'confidence': final_confidence,
+            'reason': valid_results[0].get('reason', 'Multiple indicators'),
+            'severity': max_severity,
+            'methods_used': [r.get('method') for r in valid_results]
+        }
+    
+    def _adjust_for_reputation(self, result: Dict, user_profile: Dict) -> Dict:
+        """Adjust detection based on user reputation"""
+        reputation = user_profile.get('reputation_score', 0)
+        is_trusted = user_profile.get('is_trusted', False)
+        
+        if is_trusted:
+            result['confidence'] *= 0.5  # Reduce false positives for trusted users
+        elif reputation < -10:
+            result['confidence'] *= 1.2  # Increase sensitivity for bad actors
+        
+        result['confidence'] = min(1.0, result['confidence'])
+        result['is_spam'] = result['confidence'] >= self.config.ai_confidence_threshold
+        
+        return result
+    
+    async def train_model(self, training_data: List[Tuple[str, bool]]):
+        """Train the ML model with new data"""
+        if len(training_data) < 100:
+            self.logger.warning("Insufficient training data")
+            return
+        
+        texts, labels = zip(*training_data)
+        
         try:
-            await message.delete()
-            user_warnings[user.id] += 1
-            warning_count = user_warnings[user.id]
-            if warning_count >= MAX_WARNINGS:
-                await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
-                warning_msg = f"⚠️ {user.mention_html()} has been banned after {MAX_WARNINGS} warnings.\n\n{PROMOTION_TEXT}"
-                sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
-                # Schedule the warning message for deletion
-                asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
-                del user_warnings[user.id]
-                logger.info(f"User {user.id} banned for spam: {reason}")
-            else:
-                warning_msg = f"⚠️ {user.mention_html()}, {reason}. Warning {warning_count}/{MAX_WARNINGS}\n\n{PROMOTION_TEXT}"
-                sent_message = await context.bot.send_message(chat_id=chat_id, text=warning_msg, parse_mode='HTML')
-                # Schedule the warning message for deletion
-                asyncio.create_task(delete_message_after_delay(chat_id, sent_message.message_id, context, 10))
-                logger.info(f"Spam detected from user {user.id}: {reason}")
+            self.vectorizer.fit(texts)
+            features = self.vectorizer.transform(texts)
+            self.classifier.fit(features, labels)
+            self.is_trained = True
+            self.logger.info(f"ML model trained with {len(training_data)} samples")
         except Exception as e:
+            self.logger.error(f"Training error: {e}")
+
+
+# ============= User Management =============
+class UserManager:
+    """Advanced user profiling and reputation system"""
+    
+    def __init__(self, db_pool: DatabasePool, cache: IntelligentCache):
+        self.db = db_pool
+        self.cache = cache
+        self.logger = logging.getLogger(__name__)
+        
+    async def get_user_profile(self, user_id: int) -> Dict[str, Any]:
+        """Get or create user profile with caching"""
+        cache_key = f"user_profile_{user_id}"
+        
+        # Check cache first
+        profile = await self.cache.get(cache_key)
+        if profile:
+            return profile
+        
+        # Fetch from database
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM user_profiles WHERE user_id = $1",
+                user_id
+            )
+            
+            if not row:
+                # Create new profile
+                row = await conn.fetchrow("""
+                    INSERT INTO user_profiles (user_id) 
+                    VALUES ($1) 
+                    RETURNING *
+                """, user_id)
+            
+            profile = dict(row)
+            
+        # Cache the profile
+        await self.cache.set(cache_key, profile, ttl=600)
+        return profile
+    
+    async def update_reputation(
+        self, 
+        user_id: int, 
+        delta: int, 
+        reason: str
+    ):
+        """Update user reputation score"""
+        async with self.db.acquire() as conn:
+            await conn.execute("""
+                UPDATE user_profiles 
+                SET reputation_score = reputation_score + $2,
+                    last_seen = CURRENT_TIMESTAMP
+                WHERE user_id = $1
+            """, user_id, delta)
+        
+        # Invalidate cache
+        await self.cache.set(f"user_profile_{user_id}", None, ttl=1)
+        
+        self.logger.info(f"User {user_id} reputation changed by {delta}: {reason}")
+    
+    async def record_message(
+        self, 
+        user_id: int, 
+        chat_id: int,
+        message_text: str,
+        is_spam: bool,
+        spam_score: float,
+        reason: Optional[str] = None
+    ):
+        """Record message in history for analysis"""
+        async with self.db.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO message_history 
+                (user_id, chat_id, message_text, is_spam, spam_score, detected_reason)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, user_id, chat_id, message_text[:1000], is_spam, spam_score, reason)
+            
+            # Update user stats
+            if is_spam:
+                await conn.execute("""
+                    UPDATE user_profiles 
+                    SET spam_messages = spam_messages + 1,
+                        total_messages = total_messages + 1
+                    WHERE user_id = $1
+                """, user_id)
+            else:
+                await conn.execute("""
+                    UPDATE user_profiles 
+                    SET total_messages = total_messages + 1
+                    WHERE user_id = $1
+                """, user_id)
+
+
+# ============= Rate Limiter =============
+class AdvancedRateLimiter:
+    """Token bucket rate limiter with burst support"""
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.buckets: Dict[str, Dict[str, Any]] = {}
+        self.lock = asyncio.Lock()
+        
+    async def check_rate_limit(
+        self, 
+        key: str, 
+        max_tokens: int = 10,
+        refill_rate: float = 1.0,
+        burst_size: int = 5
+    ) -> Tuple[bool, Optional[float]]:
+        """Check if action is rate limited"""
+        async with self.lock:
+            now = time.time()
+            
+            if key not in self.buckets:
+                self.buckets[key] = {
+                    'tokens': max_tokens,
+                    'last_refill': now,
+                    'burst_tokens': burst_size
+                }
+            
+            bucket = self.buckets[key]
+            
+            # Refill tokens
+            time_passed = now - bucket['last_refill']
+            tokens_to_add = time_passed * refill_rate
+            bucket['tokens'] = min(max_tokens, bucket['tokens'] + tokens_to_add)
+            bucket['last_refill'] = now
+            
+            # Check if we can consume a token
+            if bucket['tokens'] >= 1:
+                bucket['tokens'] -= 1
+                return True, None
+            elif bucket['burst_tokens'] > 0:
+                # Use burst token
+                bucket['burst_tokens'] -= 1
+                return True, None
+            else:
+                # Calculate wait time
+                wait_time = (1 - bucket['tokens']) / refill_rate
+                return False, wait_time
+    
+    async def cleanup_old_buckets(self):
+        """Remove old unused buckets"""
+        async with self.lock:
+            now = time.time()
+            expired_keys = [
+                key for key, bucket in self.buckets.items()
+                if now - bucket['last_refill'] > 3600  # 1 hour
+            ]
+            for key in expired_keys:
+                del self.buckets[key]
+
+
+# ============= Guardian Bot Main Class =============
+class GuardianBot:
+    """Main bot class with all enhanced features"""
+    
+    def __init__(self):
+        self.config = BotConfig()
+        self.logger = setup_logging()
+        self.db = DatabasePool(self.config)
+        self.cache = IntelligentCache()
+        self.ai_detector = AdvancedAIDetector(self.config)
+        self.rate_limiter = AdvancedRateLimiter(self.config)
+        self.user_manager = None  # Initialized after DB
+        
+        # State management
+        self.warnings: Dict[int, int] = defaultdict(int)
+        self.blacklist: Set[str] = set()
+        self.allowed_chats: Set[int] = set()
+        self.forward_whitelist: Set[int] = set()
+        self.dynamic_commands: Dict[str, Dict] = {}
+        
+        # Performance metrics
+        self.metrics = {
+            'messages_processed': 0,
+            'spam_detected': 0,
+            'users_banned': 0,
+            'false_positives': 0,
+            'start_time': datetime.now()
+        }
+        
+        # Flask app for health checks
+        self.flask_app = self._create_flask_app()
+        
+    def _create_flask_app(self) -> Flask:
+        """Create Flask app for health checks and metrics"""
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def health():
+            uptime = datetime.now() - self.metrics['start_time']
+            return {
+                'status': 'healthy',
+                'version': '3.0',
+                'uptime': str(uptime),
+                'metrics': self.metrics,
+                'cache_stats': self.cache.get_stats()
+            }
+        
+        @app.route('/metrics')
+        def metrics():
+            return self.metrics
+        
+        return app
+    
+    async def initialize(self):
+        """Initialize all bot components"""
+        self.logger.info("🚀 Initializing Guardian Bot v3.0...")
+        
+        # Initialize database
+        await self.db.initialize()
+        
+        # Initialize user manager
+        self.user_manager = UserManager(self.db, self.cache)
+        
+        # Load configurations
+        await self._load_configurations()
+        
+        # Start background tasks
+        asyncio.create_task(self._periodic_cleanup())
+        asyncio.create_task(self._train_ml_model())
+        
+        self.logger.info("✅ Guardian Bot initialized successfully!")
+    
+    async def _load_configurations(self):
+        """Load all configurations from database"""
+        async with self.db.acquire() as conn:
+            # Load blacklist
+            rows = await conn.fetch("SELECT word FROM blacklist")
+            self.blacklist = {row['word'].lower() for row in rows}
+            
+            # Load allowed chats
+            rows = await conn.fetch("SELECT chat_id FROM allowed_chats")
+            self.allowed_chats = {row['chat_id'] for row in rows}
+            
+            # Load forward whitelist
+            rows = await conn.fetch("SELECT user_id FROM forward_whitelist")
+            self.forward_whitelist = {row['user_id'] for row in rows}
+            
+            # Load settings
+            rows = await conn.fetch("SELECT setting_key, setting_value FROM bot_settings")
+            for row in rows:
+                if row['setting_key'] == 'max_warnings':
+                    self.config.max_warnings = int(row['setting_value'].get('value', 10))
+        
+        self.logger.info(f"Loaded: {len(self.blacklist)} blacklist words, "
+                        f"{len(self.allowed_chats)} allowed chats")
+    
+    async def _periodic_cleanup(self):
+        """Periodic cleanup tasks"""
+        while True:
+            await asyncio.sleep(3600)  # Every hour
+            try:
+                # Cleanup rate limiter
+                await self.rate_limiter.cleanup_old_buckets()
+                
+                # Clear old cache entries
+                await self.cache.clear()
+                
+                # Cleanup old warnings
+                now = datetime.now()
+                expired_users = [
+                    user_id for user_id, timestamp in self.warnings.items()
+                    if isinstance(timestamp, datetime) and (now - timestamp).days > 7
+                ]
+                for user_id in expired_users:
+                    del self.warnings[user_id]
+                
+                self.logger.info("Periodic cleanup completed")
+            except Exception as e:
+                self.logger.error(f"Cleanup error: {e}")
+    
+    async def _train_ml_model(self):
+        """Periodically retrain ML model with new data"""
+        while True:
+            await asyncio.sleep(86400)  # Daily
+            try:
+                async with self.db.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT message_text, is_spam 
+                        FROM ml_training_data 
+                        WHERE verified = true
+                        ORDER BY created_at DESC
+                        LIMIT 10000
+                    """)
+                    
+                    if len(rows) >= 100:
+                        training_data = [(row['message_text'], row['is_spam']) for row in rows]
+                        await self.ai_detector.train_model(training_data)
+                        self.logger.info(f"ML model retrained with {len(training_data)} samples")
+                
+            except Exception as e:
+                self.logger.error(f"ML training error: {e}")
+    
+    # ============= Message Handling =============
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced message handling with AI and caching"""
+        if not update.message or not update.message.from_user:
+            return
+        
+        user = update.message.from_user
+        chat_id = update.effective_chat.id
+        message = update.message
+        
+        # Skip bot messages
+        if user.is_bot:
+            asyncio.create_task(self._delete_message_after_delay(
+                chat_id, message.message_id, context
+            ))
+            return
+        
+        # Check if chat is allowed
+        if chat_id not in self.allowed_chats:
+            return
+        
+        # Admin check
+        if user.id in self.config.admin_ids:
+            return
+        
+        # Rate limiting
+        rate_limit_key = f"user_{user.id}_{chat_id}"
+        allowed, wait_time = await self.rate_limiter.check_rate_limit(
+            rate_limit_key,
+            max_tokens=self.config.rate_limit_max_messages,
+            refill_rate=self.config.rate_limit_max_messages / self.config.rate_limit_window
+        )
+        
+        if not allowed:
+            await self._handle_rate_limit_violation(update, context, wait_time)
+            return
+        
+        # Get user profile
+        user_profile = await self.user_manager.get_user_profile(user.id)
+        
+        # Extract and analyze message
+        text = message.text or message.caption or ""
+        if not text and not message.forward_from:
+            return
+        
+        # Check forwarding permissions
+        if (message.forward_from or message.forward_from_chat) and user.id not in self.forward_whitelist:
+            await self._handle_spam_detection(
+                update, context, user, chat_id, message,
+                reason="Unauthorized forwarding",
+                severity="medium"
+            )
+            return
+        
+        # Analyze message
+        analysis_result = await self.ai_detector.analyze_message(
+            text, 
+            user_profile=user_profile
+        )
+        
+        # Record message
+        await self.user_manager.record_message(
+            user.id, chat_id, text,
+            analysis_result['is_spam'],
+            analysis_result['confidence'],
+            analysis_result.get('reason')
+        )
+        
+        # Handle detection result
+        if analysis_result['is_spam']:
+            await self._handle_spam_detection(
+                update, context, user, chat_id, message,
+                reason=analysis_result['reason'],
+                severity=analysis_result.get('severity', 'medium'),
+                confidence=analysis_result['confidence']
+            )
+        else:
+            # Update positive reputation for clean messages
+            if user_profile['total_messages'] % 50 == 0:  # Every 50 messages
+                await self.user_manager.update_reputation(
+                    user.id, 1, "Consistent clean messaging"
+                )
+        
+        # Update metrics
+        self.metrics['messages_processed'] += 1
+    
+    async def _handle_spam_detection(
+        self, 
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user: User,
+        chat_id: int,
+        message: Message,
+        reason: str,
+        severity: str = "medium",
+        confidence: float = 1.0
+    ):
+        """Handle detected spam with appropriate actions"""
+        try:
+            # Delete the spam message
+            await message.delete()
+            
+            # Update metrics
+            self.metrics['spam_detected'] += 1
+            
+            # Update user reputation
+            reputation_penalty = {
+                'critical': -10,
+                'high': -5,
+                'medium': -2,
+                'low': -1
+            }.get(severity, -2)
+            
+            await self.user_manager.update_reputation(
+                user.id, reputation_penalty, f"Spam detected: {reason}"
+            )
+            
+            # Update warnings
+            self.warnings[user.id] += 1
+            warning_count = self.warnings[user.id]
+            
+            # Determine action based on severity and warnings
+            if severity == 'critical' or warning_count >= self.config.max_warnings:
+                # Ban user
+                await context.bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
+                
+                ban_message = (
+                    f"⛔ {user.mention_html()} has been permanently banned.\n"
+                    f"Reason: {reason}\n"
+                    f"Severity: {severity.upper()}\n\n"
+                    f"{self.config.promotion_text}"
+                )
+                
+                sent_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=ban_message,
+                    parse_mode=ParseMode.HTML
+                )
+                
+                # Schedule deletion
+                asyncio.create_task(self._delete_message_after_delay(
+                    chat_id, sent_msg.message_id, context
+                ))
+                
+                # Clear warnings
+                del self.warnings[user.id]
+                
+                # Update metrics
+                self.metrics['users_banned'] += 1
+                
+                self.logger.warning(f"User {user.id} banned for: {reason} (severity: {severity})")
+                
+            elif warning_count >= self.config.max_warnings - 2:
+                # Final warning
+                warning_msg = (
+                    f"⚠️ FINAL WARNING {user.mention_html()}!\n"
+                    f"Reason: {reason}\n"
+                    f"Warnings: {warning_count}/{self.config.max_warnings}\n"
+                    f"Next violation will result in a permanent ban.\n\n"
+                    f"{self.config.promotion_text}"
+                )
+                
+                sent_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=warning_msg,
+                    parse_mode=ParseMode.HTML
+                )
+                
+                asyncio.create_task(self._delete_message_after_delay(
+                    chat_id, sent_msg.message_id, context, delay=15
+                ))
+                
+            else:
+                # Regular warning
+                warning_msg = (
+                    f"⚠️ {user.mention_html()}, your message was removed.\n"
+                    f"Reason: {reason}\n"
+                    f"Warning {warning_count}/{self.config.max_warnings}\n\n"
+                    f"{self.config.promotion_text}"
+                )
+                
+                sent_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=warning_msg,
+                    parse_mode=ParseMode.HTML
+                )
+                
+                asyncio.create_task(self._delete_message_after_delay(
+                    chat_id, sent_msg.message_id, context
+                ))
+                
+            self.logger.info(f"Spam from {user.id}: {reason} (confidence: {confidence:.2f})")
+            
+        except TelegramError as e:
+            self.logger.error(f"Telegram error handling spam: {e}")
+        except Exception as e:
+            self.logger.error(f"Error handling spam detection: {e}")
+    
+    async def _handle_rate_limit_violation(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        wait_time: float
+    ):
+        """Handle rate limit violations"""
+        try:
+            await update.message.delete()
+            
+            msg = await update.message.reply_text(
+                f"⏳ Slow down! Please wait {wait_time:.1f} seconds before sending another message."
+            )
+            
+            asyncio.create_task(self._delete_message_after_delay(
+                update.effective_chat.id, msg.message_id, context, delay=5
+            ))
+            
+        except Exception as e:
+            self.logger.error(f"Error handling rate limit: {e}")
+    
+    async def _delete_message_after_delay(
+        self,
+        chat_id: int,
+        message_id: int,
+        context: ContextTypes.DEFAULT_TYPE,
+        delay: int = 10
+    ):
+        """Delete message after delay with error handling"""
+        await asyncio.sleep(delay)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError as e:
             if "message to delete not found" not in str(e).lower():
-                logger.error(f"Action error: {e}")
+                self.logger.debug(f"Could not delete message: {e}")
+    
+    # ============= Command Handlers =============
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced start command"""
+        welcome_text = (
+            "🛡️ **Guardian Bot v3.0 - Advanced Protection System**\n\n"
+            "I'm an AI-powered bot that protects your group from:\n"
+            "• Spam and scam messages\n"
+            "• Inappropriate content\n"
+            "• Suspicious links and phishing\n"
+            "• Rate limit violations\n\n"
+            "Features:\n"
+            "✅ Multi-layer AI detection\n"
+            "✅ Machine learning adaptation\n"
+            "✅ User reputation system\n"
+            "✅ Intelligent caching\n"
+            "✅ Real-time pattern matching\n\n"
+            "Use /help to see available commands."
+        )
+        await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced help command"""
+        user_id = update.effective_user.id
+        
+        if user_id in self.config.admin_ids:
+            help_text = (
+                "📋 **Admin Commands:**\n\n"
+                "**Protection:**\n"
+                "/allowchat <id> - Allow bot in chat\n"
+                "/allowthischat - Allow current chat\n"
+                "/block <words> - Block words\n"
+                "/unblock <words> - Unblock words\n"
+                "/setmaxwarnings <n> - Set warning threshold\n\n"
+                "**User Management:**\n"
+                "/allowforward <user> - Allow forwarding\n"
+                "/revokeforward <user> - Revoke forwarding\n"
+                "/trust <user> - Mark user as trusted\n"
+                "/untrust <user> - Remove trusted status\n"
+                "/checkuser <user> - Check user profile\n\n"
+                "**Analytics:**\n"
+                "/stats - View statistics\n"
+                "/metrics - Detailed metrics\n"
+                "/cache - Cache statistics\n"
+                "/mlstats - ML model stats\n\n"
+                "**Configuration:**\n"
+                "/export - Export configuration\n"
+                "/import - Import configuration\n"
+                "/reset - Reset to defaults\n"
+            )
+        else:
+            help_text = (
+                "📋 **User Commands:**\n\n"
+                "/start - Welcome message\n"
+                "/help - Show this help\n"
+                "/report - Report spam (reply to message)\n"
+            )
+        
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enhanced statistics command"""
+        if update.effective_user.id not in self.config.admin_ids:
+            await update.message.reply_text("❌ Admin only command")
+            return
+        
+        uptime = datetime.now() - self.metrics['start_time']
+        cache_stats = self.cache.get_stats()
+        
+        # Get database stats
+        async with self.db.acquire() as conn:
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM user_profiles")
+            spam_users = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_profiles WHERE spam_messages > 0"
+            )
+            trusted_users = await conn.fetchval(
+                "SELECT COUNT(*) FROM user_profiles WHERE is_trusted = true"
+            )
+        
+        stats_text = f"""
+📊 **Guardian Bot Statistics**
 
+**System:**
+• Version: 3.0
+• Uptime: {uptime}
+• Memory Cache: {cache_stats['size']}/{cache_stats['max_size']}
+• Cache Hit Rate: {cache_stats['hit_rate']}
+
+**Protection:**
+• Messages Processed: {self.metrics['messages_processed']:,}
+• Spam Detected: {self.metrics['spam_detected']:,}
+• Users Banned: {self.metrics['users_banned']:,}
+• Detection Rate: {(self.metrics['spam_detected'] / max(1, self.metrics['messages_processed']) * 100):.2f}%
+
+**Users:**
+• Total Users: {total_users:,}
+• Spam Users: {spam_users:,}
+• Trusted Users: {trusted_users:,}
+• Active Warnings: {len(self.warnings)}
+
+**Configuration:**
+• Blacklist Words: {len(self.blacklist)}
+• Allowed Chats: {len(self.allowed_chats)}
+• Max Warnings: {self.config.max_warnings}
+• AI Threshold: {self.config.ai_confidence_threshold}
+
+**AI Model:**
+• ML Trained: {'Yes' if self.ai_detector.is_trained else 'No'}
+• Pattern Rules: {sum(len(p) for p in self.ai_detector.compiled_patterns.values())}
+        """
+        
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def cmd_allowthischat(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Allow current chat"""
+        if update.effective_user.id not in self.config.admin_ids:
+            await update.message.reply_text("❌ Admin only command")
+            return
+        
+        chat_id = update.effective_chat.id
+        chat_name = update.effective_chat.title or "Private Chat"
+        
+        async with self.db.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO allowed_chats (chat_id, chat_name, added_by)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id) DO UPDATE
+                SET chat_name = $2
+            """, chat_id, chat_name, update.effective_user.id)
+        
+        self.allowed_chats.add(chat_id)
+        
+        await update.message.reply_text(
+            f"✅ Bot activated in this chat!\n"
+            f"Chat ID: `{chat_id}`\n"
+            f"Chat Name: {chat_name}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def cmd_block(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Block words with severity levels"""
+        if update.effective_user.id not in self.config.admin_ids:
+            await update.message.reply_text("❌ Admin only command")
+            return
+        
+        if len(context.args) < 1:
+            await update.message.reply_text(
+                "Usage: /block <word1> <word2> ...\n"
+                "Or: /block high <word> - for high severity"
+            )
+            return
+        
+        severity = 1
+        words_to_add = context.args
+        
+        # Check for severity level
+        if context.args[0] in ['low', 'medium', 'high', 'critical']:
+            severity_map = {'low': 1, 'medium': 2, 'high': 3, 'critical': 4}
+            severity = severity_map[context.args[0]]
+            words_to_add = context.args[1:]
+        
+        if not words_to_add:
+            await update.message.reply_text("Please provide words to block")
+            return
+        
+        added_count = 0
+        async with self.db.acquire() as conn:
+            for word in words_to_add:
+                word_lower = word.lower()
+                try:
+                    await conn.execute("""
+                        INSERT INTO blacklist (word, severity, added_by)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (word) DO UPDATE
+                        SET severity = $2
+                    """, word_lower, severity, update.effective_user.id)
+                    self.blacklist.add(word_lower)
+                    added_count += 1
+                except Exception as e:
+                    self.logger.error(f"Error adding word {word}: {e}")
+        
+        severity_names = {1: 'Low', 2: 'Medium', 3: 'High', 4: 'Critical'}
+        await update.message.reply_text(
+            f"✅ Added {added_count} word(s) to blacklist\n"
+            f"Severity: {severity_names[severity]}"
+        )
+    
+    def run(self):
+        """Run the bot with enhanced error handling"""
+        # Start Flask in background
+        flask_thread = threading.Thread(
+            target=lambda: self.flask_app.run(
+                host='0.0.0.0', 
+                port=self.config.port,
+                debug=False
+            ),
+            daemon=True
+        )
+        flask_thread.start()
+        
+        # Setup Telegram bot
+        application = Application.builder().token(self.config.telegram_token).build()
+        
+        # Add command handlers
+        application.add_handler(CommandHandler("start", self.cmd_start))
+        application.add_handler(CommandHandler("help", self.cmd_help))
+        application.add_handler(CommandHandler("stats", self.cmd_stats))
+        application.add_handler(CommandHandler("allowthischat", self.cmd_allowthischat))
+        application.add_handler(CommandHandler("block", self.cmd_block))
+        
+        # Add message handler
+        application.add_handler(MessageHandler(
+            filters.ALL & ~filters.COMMAND,
+            self.handle_message
+        ))
+        
+        # Initialize bot components
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.initialize())
+        
+        # Start polling
+        self.logger.info("🛡️ Guardian Bot v3.0 is now running!")
+        application.run_polling(
+            timeout=30,
+            pool_timeout=30,
+            read_timeout=20,
+            write_timeout=20,
+            connect_timeout=20,
+            allowed_updates=Update.ALL_TYPES
+        )
+
+
+# ============= Entry Point =============
 def main():
-    setup_database()
-    load_blacklist()
-    load_allowed_chats()
-    load_forward_whitelist()
-    load_dynamic_commands()
-    load_bot_settings()
-    
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    """Main entry point"""
+    try:
+        bot = GuardianBot()
+        bot.run()
+    except KeyboardInterrupt:
+        print("\n👋 Guardian Bot shutting down gracefully...")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        raise
 
-    # Add error handler
-    application.add_error_handler(error_handler)
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("addword", addword))
-    application.add_handler(CommandHandler("block", block))  # New block command
-    application.add_handler(CommandHandler("setmaxwarnings", setmaxwarnings))  # New setmaxwarnings command
-    application.add_handler(CommandHandler("addcommand", addcommand))
-    application.add_handler(CommandHandler("adddynamic", add_dynamic_command))
-    application.add_handler(CommandHandler("listcommands", list_commands))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("report", report_spam))
-    application.add_handler(CommandHandler("allowchat", allowchat))
-    application.add_handler(CommandHandler("allowthischat", allowthischat))
-    application.add_handler(CommandHandler("listchats", listchats))
-    application.add_handler(CommandHandler("allowforward", allowforward))
-    application.add_handler(CommandHandler("revokeforward", revokeforward))
-    application.add_handler(CommandHandler("listforwarders", listforwarders))
-    application.add_handler(CommandHandler("botversion", botversion))
-    application.add_handler(CommandHandler("allowchannel", allowchannel))
-    
-    # Handle custom commands
-    command_list = r'^/(start|help|addword|block|setmaxwarnings|addcommand|adddynamic|listcommands|stats|report|allowchat|allowthischat|listchats|allowforward|revokeforward|listforwarders|botversion|allowchannel)'
-    application.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(command_list), handle_custom_command))
-    
-    # Handle dynamic commands
-    application.add_handler(MessageHandler(filters.COMMAND, handle_dynamic_command))
-    
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-
-    logger.info(f"🛡️ Guardian Bot is now running with dynamic commands and {MAX_WARNINGS} max warnings...")
-    application.run_polling(
-    timeout=1000,
-    pool_timeout=1000,
-    read_timeout=1000,
-    write_timeout=1000,
-    connect_timeout=1000
-)
 
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
     main()
