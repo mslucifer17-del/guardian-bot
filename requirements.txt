@@ -4,3 +4,4 @@ flask
 waitress
 psycopg2-binary
 python-dotenv
+aiohttp
