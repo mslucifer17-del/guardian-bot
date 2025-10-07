@@ -25,14 +25,14 @@ CHANNEL_ID = -1002533091260 # Replace with your actual channel ID
 PROMOTION_TEXT = "For promotions, join: https://t.me/+scHqQ2SR0J45NjQ1"
 MAX_WARNINGS = int(os.environ.get("MAX_WARNINGS", 10)) # Configurable warning threshold
 
-Setup logging
+# Setup logging
 logging.basicConfig(
 format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 level=logging.INFO
 )
 logger = logging.getLogger(name)
 
-AI Setup for Spam Detection
+# AI Setup for Spam Detection
 SPAM_DETECTION_PROMPT = """You are a vigilant spam detection AI for Telegram. Analyze messages and:
 
 Reply with "SPAM" if it contains promotions, scams, ads, or suspicious links
@@ -50,7 +50,7 @@ forward_whitelist_users = set()
 message_rate_limit = {}
 dynamic_commands = {} # Store for dynamic commands
 
-Advanced spam patterns
+# Advanced spam patterns
 spam_patterns = [
 r"lowest price", r"premium collection", r"dm for purchase", r"payment method",
 r"combo novd", r"latest updated", r"desi cp", r"indian cp", r"foreign cp",
