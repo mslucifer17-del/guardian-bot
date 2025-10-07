@@ -80,7 +80,7 @@ Network timeout, log as warning instead of error
 logger.warning(f"Timeout when deleting message {message_id} in chat {chat_id}")
 elif "not enough rights" in error_msg:
 
-Bot doesn't have permission to delete messages
+print("Bot doesn't have permission to delete messages")
 logger.warning(f"Bot doesn't have permission to delete messages in chat {chat_id}")
 else:
 
