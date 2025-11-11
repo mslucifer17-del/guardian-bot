@@ -38,7 +38,7 @@ SPAM_DETECTION_PROMPT = """You are a vigilant spam detection AI for Telegram. An
 3. Consider cultural context and multiple languages
 4. Pay special attention to CP (child porn), adult content, selling, and illegal activities"""
 genai.configure(api_key=GEMINI_API_KEY)
-spam_model = genai.GenerativeModel(model_name='gemini-1.5-flash', system_instruction=SPAM_DETECTION_PROMPT)
+spam_model = genai.GenerativeModel(model_name='gemini-2.5-flash', system_instruction=SPAM_DETECTION_PROMPT)
 
 # In-memory stores
 user_warnings = defaultdict(int)
