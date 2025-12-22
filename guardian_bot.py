@@ -2180,6 +2180,9 @@ def main() -> None:
     
     # Load settings
     settings = Settings.from_env()
+    # --- YE LINE ADD KAREIN DEBUGGING KE LIYE ---
+    print(f"DEBUG: Loaded Admin IDs: {settings.admin_user_ids}")
+    print(f"DEBUG: Checking against Type: {type(settings.admin_user_ids)}")
     validate_settings(settings)
     
     # Initialize database
