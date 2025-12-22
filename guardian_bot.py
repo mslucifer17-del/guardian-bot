@@ -367,13 +367,28 @@ def setup_database() -> None:
     
     with db.conn() as conn:
         with conn.cursor() as cur:
+            # 1. Create tables
             for table_sql in tables:
                 try:
                     cur.execute(table_sql)
                 except Exception as e:
                     logger.warning(f"Table creation warning: {e}")
-        conn.commit()
-    
+            
+            conn.commit()
+
+            # 2. AUTO-FIX: Old Database Repair
+            # Agar purana DB hai, to naye columns add karein
+            try:
+                # Fix blacklist table (missing severity)
+                cur.execute("ALTER TABLE blacklist ADD COLUMN IF NOT EXISTS severity INTEGER DEFAULT 1;")
+                # Fix spam_patterns (missing is_regex)
+                cur.execute("ALTER TABLE spam_patterns ADD COLUMN IF NOT EXISTS is_regex BOOLEAN DEFAULT FALSE;")
+                conn.commit()
+                logger.info("✅ Database schema auto-repaired (added missing columns)")
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"Schema repair skipped: {e}")
+
     logger.info("✅ Database tables initialized")
 
 
