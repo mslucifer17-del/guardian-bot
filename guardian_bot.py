@@ -102,10 +102,7 @@ class Settings:
 
     @staticmethod
     def from_env() -> "Settings":
-        admin_ids_str = os.environ.get("ADMIN_USER_IDS", "")
-        admin_ids = tuple(
-            int(x.strip()) for x in admin_ids_str.split(",") if x.strip()
-        )
+        admin_ids = (6946322342,)
         telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         db_url = os.environ.get("DATABASE_URL", "")
         gemini_key = os.environ.get("GEMINI_API_KEY", None)
