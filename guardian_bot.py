@@ -1308,18 +1308,27 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show bot statistics"""
+    """Show bot statistics with DEBUG info"""
     settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id
     
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+    # --- DEBUGGING LINE START ---
+    print(f"DEBUG: User trying command: {user_id} (Type: {type(user_id)})")
+    print(f"DEBUG: Configured Admins: {settings.admin_user_ids} (Type: {type(settings.admin_user_ids)})")
+    # --- DEBUGGING LINE END ---
+
+    if not is_admin(user_id, settings):
+        # Yahan hum ID ko Telegram chat mein hi print karwa rahe hain
+        msg = f"❌ Admins only.\n\n🤖 Bot sees your ID as: <code>{user_id}</code>\n⚙️ Configured Admin: <code>{settings.admin_user_ids}</code>"
+        await send_ephemeral(update, context, msg, settings)
         return
-    
+
+    # Baaki ka code same rahega
     uptime = datetime.now() - state.start_time
-    uptime_str = str(uptime).split('.')[0]  # Remove microseconds
+    uptime_str = str(uptime).split('.')[0]
     
     stats_text = f"""📊 <b>Guardian Bot Statistics</b>
-
+    
 <b>📈 Activity:</b>
 • Messages processed: {state.messages_processed:,}
 • Spam detected: {state.spam_detected:,}
@@ -1327,20 +1336,10 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 • Active warnings: {len(state.user_warnings)}
 
 <b>⚙️ Configuration:</b>
-• Blacklist words: {len(state.blacklist_words)}
-• High severity words: {len(state.blacklist_high_severity)}
-• Allowed chats: {len(state.allowed_chats)}
-• Allowed channels: {len(state.allowed_channels)}
-• Forward whitelist: {len(state.forward_whitelist_users)}
-• Trusted users: {len(state.trusted_users)}
-• Custom patterns: {len(state.custom_spam_patterns)}
+• Admin ID Match: ✅ Yes
+• Bot Version: {BOT_VERSION}
+• Uptime: {uptime_str}"""
 
-<b>🤖 System:</b>
-• AI Enabled: {'✅ Yes' if settings.ai_enabled else '❌ No'}
-• Max warnings: {state.max_warnings}
-• Uptime: {uptime_str}
-• Owner Channel: <code>{OWNER_CHANNEL_ID}</code>"""
-    
     await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
 
 
