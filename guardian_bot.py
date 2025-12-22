@@ -2170,11 +2170,14 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["settings"] = settings
     
     # Add job for cleanup
-    application.job_queue.run_repeating(
-        cleanup_old_data,
-        interval=timedelta(minutes=30),
-        first=timedelta(minutes=5)
-    )
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            cleanup_old_data,
+            interval=timedelta(minutes=30),
+            first=timedelta(minutes=5)
+        )
+    else:
+        logger.warning("⚠️ JobQueue not available. Install 'python-telegram-bot[job-queue]' to enable background cleanup.")
     
     return application
 
