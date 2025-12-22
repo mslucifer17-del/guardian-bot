@@ -1,3 +1,6 @@
+is code ko update kar do jo bhi dikkat hai sab thik karo and ise bhot jata powerful bana do
+ye meri channel id hai isse aane wali post ko delete na kare -1003330141433, upra code update kar ke de do
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
