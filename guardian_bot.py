@@ -377,12 +377,17 @@ def setup_database() -> None:
             conn.commit()
 
             # 2. AUTO-FIX: Old Database Repair
-            # Agar purana DB hai, to naye columns add karein
             try:
                 # Fix blacklist table (missing severity)
                 cur.execute("ALTER TABLE blacklist ADD COLUMN IF NOT EXISTS severity INTEGER DEFAULT 1;")
+                
                 # Fix spam_patterns (missing is_regex)
                 cur.execute("ALTER TABLE spam_patterns ADD COLUMN IF NOT EXISTS is_regex BOOLEAN DEFAULT FALSE;")
+                
+                # --- FIX ADDED HERE ---
+                # Fix allowed_chats (missing chat_title)
+                cur.execute("ALTER TABLE allowed_chats ADD COLUMN IF NOT EXISTS chat_title TEXT;")
+                
                 conn.commit()
                 logger.info("✅ Database schema auto-repaired (added missing columns)")
             except Exception as e:
