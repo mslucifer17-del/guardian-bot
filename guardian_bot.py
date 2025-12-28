@@ -378,18 +378,36 @@ def setup_database() -> None:
 
             # 2. AUTO-FIX: Old Database Repair
             try:
-                # Fix blacklist table (missing severity)
+                # Add missing columns
                 cur.execute("ALTER TABLE blacklist ADD COLUMN IF NOT EXISTS severity INTEGER DEFAULT 1;")
-                
-                # Fix spam_patterns (missing is_regex)
                 cur.execute("ALTER TABLE spam_patterns ADD COLUMN IF NOT EXISTS is_regex BOOLEAN DEFAULT FALSE;")
-                
-                # --- FIX ADDED HERE ---
-                # Fix allowed_chats (missing chat_title)
                 cur.execute("ALTER TABLE allowed_chats ADD COLUMN IF NOT EXISTS chat_title TEXT;")
                 
+                # --- FIX: Upgrade ID columns to BIGINT ---
+                # This fixes "Integer out of range" errors
+                updates = [
+                    "ALTER TABLE allowed_chats ALTER COLUMN chat_id TYPE BIGINT;",
+                    "ALTER TABLE allowed_chats ALTER COLUMN added_by TYPE BIGINT;",
+                    "ALTER TABLE blacklist ALTER COLUMN added_by TYPE BIGINT;",
+                    "ALTER TABLE allowed_channels ALTER COLUMN channel_id TYPE BIGINT;",
+                    "ALTER TABLE allowed_channels ALTER COLUMN added_by TYPE BIGINT;",
+                    "ALTER TABLE banned_users ALTER COLUMN user_id TYPE BIGINT;",
+                    "ALTER TABLE banned_users ALTER COLUMN chat_id TYPE BIGINT;",
+                    "ALTER TABLE banned_users ALTER COLUMN banned_by TYPE BIGINT;",
+                    "ALTER TABLE trusted_users ALTER COLUMN user_id TYPE BIGINT;",
+                    "ALTER TABLE trusted_users ALTER COLUMN added_by TYPE BIGINT;",
+                    "ALTER TABLE user_stats ALTER COLUMN user_id TYPE BIGINT;"
+                ]
+                
+                for up_sql in updates:
+                    try:
+                        cur.execute(up_sql)
+                    except Exception:
+                        # Ignore errors if column doesn't exist or is already bigint
+                        pass
+                
                 conn.commit()
-                logger.info("✅ Database schema auto-repaired (added missing columns)")
+                logger.info("✅ Database schema auto-repaired (columns upgraded to BIGINT)")
             except Exception as e:
                 conn.rollback()
                 logger.warning(f"Schema repair skipped: {e}")
