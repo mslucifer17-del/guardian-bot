@@ -1110,13 +1110,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Update stats
     state.messages_processed += 1
     
-    # ===== FORWARD HANDLING =====
-    # Check forwarded messages
-    forward_from_chat = msg.forward_from_chat
-    forward_from_user = msg.forward_from
+    # ===== FORWARD HANDLING (Updated for v21+) =====
+    # Check forwarded messages using forward_origin
+    forward_origin = getattr(msg, "forward_origin", None)
+    is_forward = forward_origin is not None
     
-    is_forward = forward_from_chat is not None or forward_from_user is not None
-    
+    forward_from_chat = None
+    forward_from_user = None
+
+    if is_forward:
+        # Extract Chat/Channel info
+        if hasattr(forward_origin, "chat"): # Origin is a Channel
+            forward_from_chat = forward_origin.chat
+        elif hasattr(forward_origin, "sender_chat"): # Origin is an anonymous Chat
+            forward_from_chat = forward_origin.sender_chat
+            
+        # Extract User info
+        if hasattr(forward_origin, "sender_user"): # Origin is a User
+            forward_from_user = forward_origin.sender_user
+
     if is_forward:
         # Allow forwards from owner channel
         if forward_from_chat and is_owner_channel(forward_from_chat.id):
@@ -1129,6 +1141,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         
         # Allow forwards from whitelisted users
+        # Note: forward_whitelist checks the person SENDING the message, not the original author
         if user_id in state.forward_whitelist_users:
             logger.debug(f"✅ Forward allowed for whitelisted user: {user_id}")
             return
@@ -1940,9 +1953,10 @@ async def cmd_setmaxwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     if not context.args:
-        await send_ephemeral(update, context, f"Current: {state.max_warnings}\nUsage: /setmaxwarnings <number>", settings)
+        # FIX: Use &lt; and &gt; instead of < and >
+        await send_ephemeral(update, context, f"Current: {state.max_warnings}\nUsage: /setmaxwarnings &lt;number&gt;", settings)
         return
-    
+        
     try:
         new_max = max(1, int(context.args[0]))
     except ValueError:
