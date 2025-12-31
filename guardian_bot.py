@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-🛡️ Guardian Bot v5.0 - AI-First Ultra Edition
+🛡️ Guardian Bot v5.0.1 - AI-First Ultra Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 • AI-powered spam detection (ALL languages)
 • Context-aware (movie requests allowed)
 • Bengali, Hindi, Tamil, Urdu, Arabic support
-• Simplified & ultra powerful
+• Database migration fix included
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ except ImportError:
 # CONFIGURATION
 # ============================================================
 
-BOT_VERSION = "5.0.0"
+BOT_VERSION = "5.0.1"
 OWNER_CHANNEL_ID = -1003330141433  # Your channel - NEVER deleted
 
 # ============================================================
@@ -208,7 +208,9 @@ class Database:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 if cur.description:
-                    return cur.fetchall()
+                    result = cur.fetchall()
+                    conn.commit()
+                    return result
                 conn.commit()
                 return None
 
@@ -221,69 +223,125 @@ db: Optional[Database] = None
 
 
 def setup_database() -> None:
+    """Setup database with migration support for old schema"""
     if not db:
         return
     
-    tables = """
-    CREATE TABLE IF NOT EXISTS allowed_chats (
-        chat_id BIGINT PRIMARY KEY,
-        chat_title TEXT,
-        added_by BIGINT,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS allowed_channels (
-        channel_id BIGINT PRIMARY KEY,
-        channel_title TEXT,
-        added_by BIGINT,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS forward_whitelist (
-        user_id BIGINT PRIMARY KEY,
-        added_by BIGINT,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS trusted_users (
-        user_id BIGINT PRIMARY KEY,
-        added_by BIGINT,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS banned_users (
-        user_id BIGINT,
-        chat_id BIGINT,
-        reason TEXT,
-        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_id, chat_id)
-    );
-    
-    CREATE TABLE IF NOT EXISTS spam_log (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        chat_id BIGINT,
-        message_text TEXT,
-        ai_verdict TEXT,
-        action_taken TEXT,
-        detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    CREATE TABLE IF NOT EXISTS bot_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-    
     with db.conn() as conn:
         with conn.cursor() as cur:
+            # Create new tables
+            tables = """
+            CREATE TABLE IF NOT EXISTS allowed_chats (
+                chat_id BIGINT PRIMARY KEY,
+                chat_title TEXT,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS allowed_channels (
+                channel_id BIGINT PRIMARY KEY,
+                channel_title TEXT,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS forward_whitelist (
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS trusted_users (
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id BIGINT,
+                chat_id BIGINT,
+                reason TEXT,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, chat_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS spam_log (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                chat_id BIGINT,
+                message_text TEXT,
+                ai_verdict TEXT,
+                action_taken TEXT,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+            
             for statement in tables.split(';'):
                 if statement.strip():
                     try:
                         cur.execute(statement)
                     except Exception as e:
-                        logger.debug(f"Table exists or error: {e}")
+                        logger.debug(f"Table exists: {e}")
+            
+            # Handle bot_settings table with migration
+            try:
+                # Check if old table exists with old column names
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'bot_settings' AND column_name = 'setting_key';
+                """)
+                old_schema = cur.fetchone() is not None
+                
+                if old_schema:
+                    # Migrate old schema to new
+                    logger.info("🔄 Migrating old bot_settings schema...")
+                    cur.execute("ALTER TABLE bot_settings RENAME COLUMN setting_key TO key;")
+                    cur.execute("ALTER TABLE bot_settings RENAME COLUMN setting_value TO value;")
+                    
+                    # Drop old columns if they exist
+                    try:
+                        cur.execute("ALTER TABLE bot_settings DROP COLUMN IF EXISTS updated_by;")
+                        cur.execute("ALTER TABLE bot_settings DROP COLUMN IF EXISTS updated_at;")
+                    except:
+                        pass
+                    
+                    # Add updated_at if not exists
+                    cur.execute("ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;")
+                    logger.info("✅ Migration complete!")
+                else:
+                    # Check if table exists at all
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_name = 'bot_settings'
+                        );
+                    """)
+                    table_exists = cur.fetchone()[0]
+                    
+                    if not table_exists:
+                        # Create new table
+                        cur.execute("""
+                            CREATE TABLE bot_settings (
+                                key TEXT PRIMARY KEY,
+                                value TEXT,
+                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            );
+                        """)
+            except Exception as e:
+                logger.warning(f"bot_settings setup: {e}")
+                # Fallback: drop and recreate
+                try:
+                    cur.execute("DROP TABLE IF EXISTS bot_settings;")
+                    cur.execute("""
+                        CREATE TABLE bot_settings (
+                            key TEXT PRIMARY KEY,
+                            value TEXT,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                except Exception as e2:
+                    logger.error(f"Failed to recreate bot_settings: {e2}")
+            
             conn.commit()
     
     logger.info("✅ Database ready")
@@ -328,33 +386,47 @@ def load_all_data(settings: Settings) -> None:
         return
     
     # Load allowed chats
-    rows = db.execute("SELECT chat_id FROM allowed_chats;")
-    state.allowed_chats = {r[0] for r in (rows or [])}
+    try:
+        rows = db.execute("SELECT chat_id FROM allowed_chats;")
+        state.allowed_chats = {r[0] for r in (rows or [])}
+    except Exception as e:
+        logger.warning(f"Could not load allowed_chats: {e}")
+        state.allowed_chats = set()
     
     # Load allowed channels (always include owner channel)
     state.allowed_channels = {OWNER_CHANNEL_ID}
     if settings.channel_id:
         state.allowed_channels.add(settings.channel_id)
-    rows = db.execute("SELECT channel_id FROM allowed_channels;")
-    state.allowed_channels |= {r[0] for r in (rows or [])}
+    try:
+        rows = db.execute("SELECT channel_id FROM allowed_channels;")
+        state.allowed_channels |= {r[0] for r in (rows or [])}
+    except Exception as e:
+        logger.warning(f"Could not load allowed_channels: {e}")
     
     # Load forward whitelist
-    rows = db.execute("SELECT user_id FROM forward_whitelist;")
-    state.forward_whitelist = {r[0] for r in (rows or [])}
+    try:
+        rows = db.execute("SELECT user_id FROM forward_whitelist;")
+        state.forward_whitelist = {r[0] for r in (rows or [])}
+    except Exception as e:
+        logger.warning(f"Could not load forward_whitelist: {e}")
+        state.forward_whitelist = set()
     
     # Load trusted users
-    rows = db.execute("SELECT user_id FROM trusted_users;")
-    state.trusted_users = {r[0] for r in (rows or [])}
+    try:
+        rows = db.execute("SELECT user_id FROM trusted_users;")
+        state.trusted_users = {r[0] for r in (rows or [])}
+    except Exception as e:
+        logger.warning(f"Could not load trusted_users: {e}")
+        state.trusted_users = set()
     
-    # Load max warnings
-    rows = db.execute("SELECT value FROM bot_settings WHERE key = 'max_warnings';")
-    if rows:
-        try:
+    # Load max warnings - with fallback
+    state.max_warnings = settings.max_warnings
+    try:
+        rows = db.execute("SELECT value FROM bot_settings WHERE key = 'max_warnings';")
+        if rows and rows[0][0]:
             state.max_warnings = int(rows[0][0])
-        except:
-            state.max_warnings = settings.max_warnings
-    else:
-        state.max_warnings = settings.max_warnings
+    except Exception as e:
+        logger.debug(f"Using default max_warnings: {e}")
     
     logger.info(f"✅ Loaded: {len(state.allowed_chats)} chats, {len(state.allowed_channels)} channels, {len(state.trusted_users)} trusted users")
 
@@ -1311,7 +1383,7 @@ def build_app(settings: Settings) -> Application:
 def main() -> None:
     print(f"""
 ╔═══════════════════════════════════════════════════════════╗
-║       🛡️  GUARDIAN BOT v{BOT_VERSION} - AI EDITION  🛡️        ║
+║      🛡️  GUARDIAN BOT v{BOT_VERSION} - AI EDITION  🛡️       ║
 ║         All Languages • Smart Detection • Fast            ║
 ╚═══════════════════════════════════════════════════════════╝
 """)
