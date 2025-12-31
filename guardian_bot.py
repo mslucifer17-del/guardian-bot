@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-🛡️ Guardian Bot v4.0 - Ultra Powerful Edition
-- Fixed all bugs
-- Added owner channel protection
-- Enhanced spam detection
-- Better performance
-- More admin controls
+🛡️ Guardian Bot v5.0 - AI-First Ultra Edition
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• AI-powered spam detection (ALL languages)
+• Context-aware (movie requests allowed)
+• Bengali, Hindi, Tamil, Urdu, Arabic support
+• Simplified & ultra powerful
 """
 
 from __future__ import annotations
@@ -26,37 +26,26 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import psycopg2
 from psycopg2 import pool as pg_pool
-from psycopg2.errors import UniqueViolation
 
 from flask import Flask, jsonify
 from waitress import serve
 
-from telegram import (
-    Chat,
-    ChatMember,
-    ChatMemberUpdated,
-    ChatPermissions,
-    Message,
-    Update,
-    User,
-)
-from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram import Message, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden
 
-# Optional AI (Gemini) for final-stage spam classification
+# Google Gemini AI
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -65,15 +54,69 @@ except ImportError:
     genai = None
 
 # ============================================================
-# OWNER CHANNEL - YE CHANNEL KABHI DELETE NAHI HOGA
+# CONFIGURATION
 # ============================================================
-OWNER_CHANNEL_ID = -1003330141433  # Aapka channel ID - Posts kabhi delete nahi honge
 
-# Bot version
-BOT_VERSION = "4.0.0"
+BOT_VERSION = "5.0.0"
+OWNER_CHANNEL_ID = -1003330141433  # Your channel - NEVER deleted
 
 # ============================================================
-# Settings & Configuration
+# AI PROMPT - Heart of the Bot (All Languages)
+# ============================================================
+
+AI_SYSTEM_PROMPT = """You are a smart spam detector for Telegram groups. These groups are:
+1. Movie Search Group - users ask for movies
+2. Friends Chat Group - casual conversations
+
+🎯 YOUR JOB: Detect ONLY harmful content. Be VERY careful not to block normal messages.
+
+✅ ALWAYS ALLOW (Reply "OK"):
+• Movie requests: "Pushpa 2 link do", "Avengers download", "KGF Hindi dubbed"
+• Content requests: "bhai wo movie bhejo", "send kar do", "link dedo"
+• Normal chat: "kaise ho", "hello", "good morning", "thanks bro"
+• Questions about movies/shows
+• Friendly conversations in ANY language
+• Short messages, greetings, emojis
+• File sharing requests between friends
+
+❌ BLOCK AS SPAM (Reply "SPAM"):
+• Self-promotion: "Join my channel", "Follow my page", "Subscribe now"
+• Advertisements: "Buy now", "Discount offer", "Limited time"
+• External promotions in ANY language:
+  - Bengali: "আমার চ্যানেলে যোগ দিন", "টাকা আয় করুন"
+  - Hindi: "मेरा चैनल जॉइन करो", "पैसे कमाओ"
+  - Tamil: "என் சேனலில் சேருங்கள்"
+  - Any language promoting external links/channels
+• Crypto/Trading scams: "Earn money", "Investment opportunity", "Double your crypto"
+• Adult service promotion
+• Unsolicited business offers
+• Mass-forward style messages with channel links
+
+⛔ BLOCK + BAN (Reply "ILLEGAL"):
+• Child exploitation (CP, CSAM, minor abuse)
+• Drug trafficking
+• Weapons sale
+• Any illegal content
+
+📋 DETECTION TIPS:
+• Obfuscated text: "j.o" + "i.n m.y c.h" = "join my channel" = SPAM
+• Mixed language spam: "Bro জয়েন my channel" = SPAM
+• Hidden links: "telegram dot me slash..." = SPAM
+• Price lists, DM offers = SPAM
+• BUT: "bro movie ka link de" = OK (friend asking for movie)
+
+🔤 YOU UNDERSTAND ALL LANGUAGES:
+Bengali, Hindi, Tamil, Telugu, Urdu, Arabic, English, Marathi, Gujarati, Kannada, Malayalam, Punjabi, and more.
+
+RESPOND WITH ONLY ONE WORD:
+• "OK" - Allow the message
+• "SPAM" - Delete message, warn user  
+• "ILLEGAL" - Delete message, ban user immediately
+
+Think carefully. Movie requests and friendly chat = OK. Promotions and scams = SPAM."""
+
+# ============================================================
+# Settings
 # ============================================================
 
 @dataclass(frozen=True)
@@ -82,23 +125,15 @@ class Settings:
     database_url: str
     admin_user_ids: Tuple[int, ...]
     port: int
-    ai_enabled: bool
     gemini_api_key: Optional[str]
-    max_warnings_default: int
+    ai_enabled: bool
+    max_warnings: int
     channel_id: Optional[int]
     promotion_text: str
-    spam_ai_model: str
-    ai_timeout_sec: float
     deletion_delay_sec: int
-    min_seconds_between_msgs: float
-    min_seconds_between_same_user_msgs: float
     flood_messages_limit: int
     flood_time_window: int
-    new_user_restriction_hours: int
-    enable_captcha: bool
-    max_message_length: int
-    max_emojis_allowed: int
-    log_channel_id: Optional[int]
+    ai_timeout_sec: float
 
     @staticmethod
     def from_env() -> "Settings":
@@ -106,108 +141,67 @@ class Settings:
         telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         db_url = os.environ.get("DATABASE_URL", "")
         gemini_key = os.environ.get("GEMINI_API_KEY", None)
-        port = int(os.environ.get("PORT", 8080))
+        
+        ai_enabled = GEMINI_AVAILABLE and bool(gemini_key)
+        
         channel_id_str = os.environ.get("CHANNEL_ID", "").strip()
         channel_id = int(channel_id_str) if channel_id_str else None
-        log_channel_str = os.environ.get("LOG_CHANNEL_ID", "").strip()
-        log_channel_id = int(log_channel_str) if log_channel_str else None
-
-        ai_enabled_env = os.environ.get("SPAM_AI_ENABLED", "true").lower() in ("1", "true", "yes")
-        ai_enabled = ai_enabled_env and GEMINI_AVAILABLE and bool(gemini_key)
-
-        max_warn = int(os.environ.get("MAX_WARNINGS", 5))
         
         return Settings(
             telegram_bot_token=telegram_token,
             database_url=db_url,
             admin_user_ids=admin_ids,
-            port=port,
-            ai_enabled=ai_enabled,
+            port=int(os.environ.get("PORT", 8080)),
             gemini_api_key=gemini_key,
-            max_warnings_default=max_warn,
+            ai_enabled=ai_enabled,
+            max_warnings=int(os.environ.get("MAX_WARNINGS", 5)),
             channel_id=channel_id,
-            promotion_text=os.environ.get("PROMOTION_TEXT", "For promotions, join: https://t.me/+scHqQ2SR0J45NjQ1"),
-            spam_ai_model=os.environ.get("SPAM_AI_MODEL", "gemini-2.0-flash"),
-            ai_timeout_sec=float(os.environ.get("AI_TIMEOUT_SEC", "7.0")),
+            promotion_text=os.environ.get("PROMOTION_TEXT", "For promotions: https://t.me/+scHqQ2SR0J45NjQ1"),
             deletion_delay_sec=int(os.environ.get("DELETION_DELAY_SEC", "10")),
-            min_seconds_between_msgs=float(os.environ.get("MIN_SECONDS_BETWEEN_MSGS", "1.5")),
-            min_seconds_between_same_user_msgs=float(os.environ.get("MIN_SECONDS_BETWEEN_SAME_USER_MSGS", "1.0")),
             flood_messages_limit=int(os.environ.get("FLOOD_MESSAGES_LIMIT", "5")),
             flood_time_window=int(os.environ.get("FLOOD_TIME_WINDOW", "10")),
-            new_user_restriction_hours=int(os.environ.get("NEW_USER_RESTRICTION_HOURS", "24")),
-            enable_captcha=os.environ.get("ENABLE_CAPTCHA", "false").lower() in ("1", "true", "yes"),
-            max_message_length=int(os.environ.get("MAX_MESSAGE_LENGTH", "4096")),
-            max_emojis_allowed=int(os.environ.get("MAX_EMOJIS_ALLOWED", "15")),
-            log_channel_id=log_channel_id,
+            ai_timeout_sec=float(os.environ.get("AI_TIMEOUT_SEC", "10.0")),
         )
 
 
-def validate_settings(settings: Settings) -> None:
-    missing: List[str] = []
-    if not settings.telegram_bot_token:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not settings.database_url:
-        missing.append("DATABASE_URL")
-    if missing:
-        raise SystemExit(f"❌ Missing required environment variables: {', '.join(missing)}")
-
-
 # ============================================================
-# Logging Setup
+# Logging
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("guardian-bot")
-
-# Reduce noise from httpx and telegram
+logger = logging.getLogger("guardian")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 
 # ============================================================
-# Database Pool & Helpers
+# Database
 # ============================================================
 
 class Database:
     _instance: Optional["Database"] = None
-    _lock = threading.Lock()
 
     def __init__(self, dsn: str):
-        self._pool: pg_pool.ThreadedConnectionPool = pg_pool.ThreadedConnectionPool(
-            minconn=2, maxconn=20, dsn=dsn
-        )
-        self._dsn = dsn
+        self._pool = pg_pool.ThreadedConnectionPool(minconn=2, maxconn=10, dsn=dsn)
 
     @classmethod
     def get_instance(cls, dsn: Optional[str] = None) -> "Database":
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    if dsn is None:
-                        raise ValueError("DSN required for first initialization")
-                    cls._instance = cls(dsn)
+        if cls._instance is None and dsn:
+            cls._instance = cls(dsn)
         return cls._instance
 
     @contextmanager
     def conn(self):
-        conn = None
+        conn = self._pool.getconn()
         try:
-            conn = self._pool.getconn()
             conn.autocommit = False
             yield conn
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            raise
         finally:
-            if conn:
-                self._pool.putconn(conn)
+            self._pool.putconn(conn)
 
     def execute(self, query: str, params: tuple = ()) -> Optional[List[tuple]]:
         with self.conn() as conn:
@@ -218,12 +212,6 @@ class Database:
                 conn.commit()
                 return None
 
-    def execute_many(self, query: str, params_list: List[tuple]) -> None:
-        with self.conn() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(query, params_list)
-                conn.commit()
-
     def close(self):
         if self._pool:
             self._pool.closeall()
@@ -233,826 +221,295 @@ db: Optional[Database] = None
 
 
 def setup_database() -> None:
-    assert db is not None
+    if not db:
+        return
     
-    tables = [
-        """
-        CREATE TABLE IF NOT EXISTS blacklist (
-            id SERIAL PRIMARY KEY,
-            word TEXT NOT NULL UNIQUE,
-            severity INTEGER DEFAULT 1,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS allowed_chats (
-            id SERIAL PRIMARY KEY,
-            chat_id BIGINT NOT NULL UNIQUE,
-            chat_title TEXT,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS custom_commands (
-            id SERIAL PRIMARY KEY,
-            command TEXT NOT NULL UNIQUE,
-            response TEXT NOT NULL,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS reported_spam (
-            id SERIAL PRIMARY KEY,
-            message TEXT NOT NULL,
-            message_hash TEXT,
-            reported_by BIGINT,
-            chat_id BIGINT,
-            reported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS forward_whitelist (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL UNIQUE,
-            username TEXT,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS allowed_channels (
-            id SERIAL PRIMARY KEY,
-            channel_id BIGINT NOT NULL UNIQUE,
-            channel_title TEXT,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS trusted_users (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL UNIQUE,
-            username TEXT,
-            trust_level INTEGER DEFAULT 1,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS user_stats (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL UNIQUE,
-            messages_count INTEGER DEFAULT 0,
-            warnings_count INTEGER DEFAULT 0,
-            spam_count INTEGER DEFAULT 0,
-            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS banned_users (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            chat_id BIGINT NOT NULL,
-            reason TEXT,
-            banned_by BIGINT,
-            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, chat_id)
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            id SERIAL PRIMARY KEY,
-            setting_key TEXT NOT NULL UNIQUE,
-            setting_value TEXT NOT NULL,
-            updated_by BIGINT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS spam_patterns (
-            id SERIAL PRIMARY KEY,
-            pattern TEXT NOT NULL UNIQUE,
-            description TEXT,
-            severity INTEGER DEFAULT 1,
-            is_regex BOOLEAN DEFAULT FALSE,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS action_logs (
-            id SERIAL PRIMARY KEY,
-            action_type TEXT NOT NULL,
-            user_id BIGINT,
-            chat_id BIGINT,
-            details JSONB,
-            performed_by BIGINT,
-            performed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_blacklist_word ON blacklist(word);
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_user_stats_user_id ON user_stats(user_id);
-        """,
-        """
-        CREATE INDEX IF NOT EXISTS idx_action_logs_performed_at ON action_logs(performed_at);
-        """,
-    ]
+    tables = """
+    CREATE TABLE IF NOT EXISTS allowed_chats (
+        chat_id BIGINT PRIMARY KEY,
+        chat_title TEXT,
+        added_by BIGINT,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS allowed_channels (
+        channel_id BIGINT PRIMARY KEY,
+        channel_title TEXT,
+        added_by BIGINT,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS forward_whitelist (
+        user_id BIGINT PRIMARY KEY,
+        added_by BIGINT,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS trusted_users (
+        user_id BIGINT PRIMARY KEY,
+        added_by BIGINT,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS banned_users (
+        user_id BIGINT,
+        chat_id BIGINT,
+        reason TEXT,
+        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, chat_id)
+    );
+    
+    CREATE TABLE IF NOT EXISTS spam_log (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT,
+        chat_id BIGINT,
+        message_text TEXT,
+        ai_verdict TEXT,
+        action_taken TEXT,
+        detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
     
     with db.conn() as conn:
         with conn.cursor() as cur:
-            # 1. Create tables
-            for table_sql in tables:
-                try:
-                    cur.execute(table_sql)
-                except Exception as e:
-                    logger.warning(f"Table creation warning: {e}")
-            
-            conn.commit()
-
-            # 2. AUTO-FIX: Old Database Repair
-            try:
-                # Add missing columns
-                cur.execute("ALTER TABLE blacklist ADD COLUMN IF NOT EXISTS severity INTEGER DEFAULT 1;")
-                cur.execute("ALTER TABLE spam_patterns ADD COLUMN IF NOT EXISTS is_regex BOOLEAN DEFAULT FALSE;")
-                cur.execute("ALTER TABLE allowed_chats ADD COLUMN IF NOT EXISTS chat_title TEXT;")
-                
-                # --- FIX: Upgrade ID columns to BIGINT ---
-                # This fixes "Integer out of range" errors
-                updates = [
-                    "ALTER TABLE allowed_chats ALTER COLUMN chat_id TYPE BIGINT;",
-                    "ALTER TABLE allowed_chats ALTER COLUMN added_by TYPE BIGINT;",
-                    "ALTER TABLE blacklist ALTER COLUMN added_by TYPE BIGINT;",
-                    "ALTER TABLE allowed_channels ALTER COLUMN channel_id TYPE BIGINT;",
-                    "ALTER TABLE allowed_channels ALTER COLUMN added_by TYPE BIGINT;",
-                    "ALTER TABLE banned_users ALTER COLUMN user_id TYPE BIGINT;",
-                    "ALTER TABLE banned_users ALTER COLUMN chat_id TYPE BIGINT;",
-                    "ALTER TABLE banned_users ALTER COLUMN banned_by TYPE BIGINT;",
-                    "ALTER TABLE trusted_users ALTER COLUMN user_id TYPE BIGINT;",
-                    "ALTER TABLE trusted_users ALTER COLUMN added_by TYPE BIGINT;",
-                    "ALTER TABLE user_stats ALTER COLUMN user_id TYPE BIGINT;"
-                ]
-                
-                for up_sql in updates:
+            for statement in tables.split(';'):
+                if statement.strip():
                     try:
-                        cur.execute(up_sql)
-                    except Exception:
-                        # Ignore errors if column doesn't exist or is already bigint
-                        pass
-                
-                conn.commit()
-                logger.info("✅ Database schema auto-repaired (columns upgraded to BIGINT)")
-            except Exception as e:
-                conn.rollback()
-                logger.warning(f"Schema repair skipped: {e}")
-
-    logger.info("✅ Database tables initialized")
+                        cur.execute(statement)
+                    except Exception as e:
+                        logger.debug(f"Table exists or error: {e}")
+            conn.commit()
+    
+    logger.info("✅ Database ready")
 
 
 # ============================================================
-# Bot State & Caches
+# Bot State (Simple & Clean)
 # ============================================================
-
-@dataclass
-class SpamScore:
-    score: int = 0
-    reasons: List[str] = field(default_factory=list)
-    
-    def add(self, points: int, reason: str):
-        self.score += points
-        self.reasons.append(reason)
-    
-    def is_spam(self, threshold: int = 50) -> bool:
-        return self.score >= threshold
-
-
-@dataclass
-class UserFloodData:
-    message_times: List[float] = field(default_factory=list)
-    last_message_hash: str = ""
-    duplicate_count: int = 0
-
 
 @dataclass
 class BotState:
-    # In-memory caches
-    user_warnings: Dict[int, int] = field(default_factory=dict)
-    user_last_message_time: Dict[int, datetime] = field(default_factory=dict)
-    user_flood_data: Dict[int, UserFloodData] = field(default_factory=lambda: defaultdict(UserFloodData))
-    
-    # Allowlists and blocklists
-    blacklist_words: Set[str] = field(default_factory=set)
-    blacklist_high_severity: Set[str] = field(default_factory=set)
+    # Caches
     allowed_chats: Set[int] = field(default_factory=set)
-    forward_whitelist_users: Set[int] = field(default_factory=set)
     allowed_channels: Set[int] = field(default_factory=set)
+    forward_whitelist: Set[int] = field(default_factory=set)
     trusted_users: Set[int] = field(default_factory=set)
     
-    # Custom patterns from DB
-    custom_spam_patterns: List[re.Pattern] = field(default_factory=list)
+    # Warnings
+    user_warnings: Dict[int, int] = field(default_factory=dict)
     
-    # Settings
-    max_warnings: int = 5
+    # Flood control
+    user_messages: Dict[int, List[float]] = field(default_factory=lambda: defaultdict(list))
+    user_last_text: Dict[int, str] = field(default_factory=dict)
+    user_repeat_count: Dict[int, int] = field(default_factory=lambda: defaultdict(int))
     
-    # Statistics
+    # Stats
     messages_processed: int = 0
-    spam_detected: int = 0
+    spam_blocked: int = 0
     users_banned: int = 0
     start_time: datetime = field(default_factory=datetime.now)
     
-    # Rate limiting
-    message_rate_limit_ts: Dict[Tuple[int, int], float] = field(default_factory=dict)
-    
-    # Cleanup tracking
-    last_cleanup: datetime = field(default_factory=datetime.now)
+    # Settings
+    max_warnings: int = 5
 
 
 state = BotState()
 
 
-# ============================================================
-# Data Loading Functions
-# ============================================================
-
-def load_blacklist_and_seed_critical(settings: Settings) -> None:
-    assert db is not None
+def load_all_data(settings: Settings) -> None:
+    """Load all data from database"""
+    if not db:
+        return
     
-    # Critical words that should always be blocked
-    critical_words = {
-        # Illegal content
-        ("cp", 10), ("child porn", 10), ("pedo", 10), ("minor", 5),
-        ("child abuse", 10), ("underage", 8), ("jailbait", 10),
-        # Spam/Commerce
-        ("premium", 3), ("collection", 2), ("price", 2), ("payment", 3),
-        ("purchase", 2), ("dm for", 3), ("lowest price", 5),
-        # Regional spam
-        ("desi", 2), ("indian cp", 10), ("foreign cp", 10), ("tamil", 2),
-        ("chinese", 1), ("arabian", 1), ("bro-sis", 5), ("dad-daughter", 8),
-        # Adult content
-        ("nude", 3), ("xxx", 4), ("porn", 5), ("sex video", 5),
-        ("onlyfans", 3), ("fansly", 3), ("18+", 2),
-        # Scam terms
-        ("earn money", 3), ("work from home", 2), ("crypto investment", 4),
-        ("double your", 5), ("guaranteed profit", 5), ("whatsapp", 2),
-    }
-    
-    with db.conn() as conn:
-        with conn.cursor() as cur:
-            # Insert critical words
-            for word, severity in critical_words:
-                try:
-                    cur.execute(
-                        """INSERT INTO blacklist (word, severity, added_by) 
-                           VALUES (%s, %s, %s) ON CONFLICT (word) DO NOTHING;""",
-                        (word.lower(), severity, settings.admin_user_ids[0] if settings.admin_user_ids else 0)
-                    )
-                except Exception:
-                    pass
-            
-            conn.commit()
-            
-            # Load all words
-            cur.execute("SELECT word, severity FROM blacklist;")
-            rows = cur.fetchall()
-            
-            state.blacklist_words = {r[0].lower() for r in rows}
-            state.blacklist_high_severity = {r[0].lower() for r in rows if r[1] >= 5}
-    
-    logger.info(f"✅ Loaded {len(state.blacklist_words)} blacklist words ({len(state.blacklist_high_severity)} high severity)")
-
-
-def load_allowed_chats() -> None:
-    assert db is not None
+    # Load allowed chats
     rows = db.execute("SELECT chat_id FROM allowed_chats;")
     state.allowed_chats = {r[0] for r in (rows or [])}
-    logger.info(f"✅ Loaded {len(state.allowed_chats)} allowed chats")
-
-
-def load_forward_whitelist() -> None:
-    assert db is not None
-    rows = db.execute("SELECT user_id FROM forward_whitelist;")
-    state.forward_whitelist_users = {r[0] for r in (rows or [])}
-    logger.info(f"✅ Loaded {len(state.forward_whitelist_users)} forward-whitelisted users")
-
-
-def load_allowed_channels(settings: Settings) -> None:
-    assert db is not None
     
-    # Start with owner channel - YE HAMESHA ALLOWED RAHEGA
-    ids: Set[int] = {OWNER_CHANNEL_ID}
-    
-    # Add configured channel
+    # Load allowed channels (always include owner channel)
+    state.allowed_channels = {OWNER_CHANNEL_ID}
     if settings.channel_id:
-        ids.add(settings.channel_id)
-    
-    # Add channels from DB
+        state.allowed_channels.add(settings.channel_id)
     rows = db.execute("SELECT channel_id FROM allowed_channels;")
-    ids |= {r[0] for r in (rows or [])}
+    state.allowed_channels |= {r[0] for r in (rows or [])}
     
-    state.allowed_channels = ids
-    logger.info(f"✅ Loaded {len(state.allowed_channels)} allowed channels (including owner channel)")
-
-
-def load_trusted_users() -> None:
-    assert db is not None
+    # Load forward whitelist
+    rows = db.execute("SELECT user_id FROM forward_whitelist;")
+    state.forward_whitelist = {r[0] for r in (rows or [])}
+    
+    # Load trusted users
     rows = db.execute("SELECT user_id FROM trusted_users;")
     state.trusted_users = {r[0] for r in (rows or [])}
-    logger.info(f"✅ Loaded {len(state.trusted_users)} trusted users")
-
-
-def load_custom_spam_patterns() -> None:
-    assert db is not None
-    rows = db.execute("SELECT pattern, is_regex FROM spam_patterns;")
-    patterns = []
-    for pattern, is_regex in (rows or []):
+    
+    # Load max warnings
+    rows = db.execute("SELECT value FROM bot_settings WHERE key = 'max_warnings';")
+    if rows:
         try:
-            if is_regex:
-                patterns.append(re.compile(pattern, re.IGNORECASE))
-            else:
-                patterns.append(re.compile(re.escape(pattern), re.IGNORECASE))
-        except re.error as e:
-            logger.warning(f"Invalid pattern '{pattern}': {e}")
-    state.custom_spam_patterns = patterns
-    logger.info(f"✅ Loaded {len(patterns)} custom spam patterns")
-
-
-def load_bot_settings(settings: Settings) -> None:
-    assert db is not None
-    state.max_warnings = settings.max_warnings_default
+            state.max_warnings = int(rows[0][0])
+        except:
+            state.max_warnings = settings.max_warnings
+    else:
+        state.max_warnings = settings.max_warnings
     
-    rows = db.execute("SELECT setting_key, setting_value FROM bot_settings;")
-    for key, value in (rows or []):
-        if key == "max_warnings":
-            try:
-                state.max_warnings = max(1, int(value))
-            except ValueError:
-                pass
-    
-    logger.info(f"✅ Settings loaded - Max warnings: {state.max_warnings}")
-
-
-def reload_all_caches(settings: Settings) -> None:
-    """Reload all caches from database"""
-    load_blacklist_and_seed_critical(settings)
-    load_allowed_chats()
-    load_forward_whitelist()
-    load_allowed_channels(settings)
-    load_trusted_users()
-    load_custom_spam_patterns()
-    load_bot_settings(settings)
+    logger.info(f"✅ Loaded: {len(state.allowed_chats)} chats, {len(state.allowed_channels)} channels, {len(state.trusted_users)} trusted users")
 
 
 # ============================================================
-# AI Spam Detection
+# AI Spam Detection (The Brain)
 # ============================================================
-
-SPAM_DETECTION_PROMPT = """You are an expert spam detection AI for Telegram groups. Your job is to protect users from:
-
-1. SPAM: Promotional messages, advertisements, unsolicited offers
-2. SCAM: Cryptocurrency scams, investment frauds, phishing attempts  
-3. ILLEGAL: Child exploitation (CSAM), drug sales, weapons trafficking
-4. ADULT: Pornography, escort services, adult content sales
-
-ANALYSIS RULES:
-- Consider obfuscation techniques (l33t speak, unicode tricks, spacing)
-- Detect hidden links and disguised URLs
-- Identify payment/commerce language patterns
-- Check for urgency tactics and too-good-to-be-true offers
-- Consider cultural context (Hindi, English, mixed languages)
-
-RESPOND WITH ONLY:
-- "SPAM" if the message violates any rule
-- "OK" if the message is legitimate
-
-Be strict but avoid false positives on normal conversation.
-"""
 
 ai_model = None
 
 
-def ai_init(settings: Settings) -> None:
+def init_ai(settings: Settings) -> None:
     global ai_model
-    if not settings.ai_enabled or not GEMINI_AVAILABLE:
-        logger.info("🤖 AI spam detection: DISABLED")
+    
+    if not settings.ai_enabled:
+        logger.warning("⚠️ AI disabled - GEMINI_API_KEY not set")
         return
     
     try:
         genai.configure(api_key=settings.gemini_api_key)
         ai_model = genai.GenerativeModel(
-            model_name=settings.spam_ai_model,
-            system_instruction=SPAM_DETECTION_PROMPT,
+            model_name="gemini-2.0-flash",
+            system_instruction=AI_SYSTEM_PROMPT,
             generation_config={
                 "temperature": 0.1,
                 "max_output_tokens": 10,
             }
         )
-        logger.info(f"🤖 AI spam detection: ENABLED ({settings.spam_ai_model})")
+        logger.info("🤖 AI Model Ready (Gemini 2.0 Flash)")
     except Exception as e:
-        logger.warning(f"⚠️ Failed to init AI model: {e}")
+        logger.error(f"❌ AI init failed: {e}")
         ai_model = None
 
 
-async def ai_check_spam(text: str, normalized: str, timeout: float) -> Tuple[Optional[bool], str]:
-    """Check if text is spam using AI. Returns (is_spam, reason)"""
-    if ai_model is None:
-        return None, ""
+async def ai_analyze(text: str, timeout: float) -> str:
+    """
+    Analyze message with AI
+    Returns: "OK", "SPAM", "ILLEGAL", or "ERROR"
+    """
+    if not ai_model or not text.strip():
+        return "OK"
+    
+    # Skip very short messages (greetings, etc.)
+    if len(text.strip()) < 5:
+        return "OK"
     
     try:
-        prompt = f"""Analyze this message:
----
-Original: {text[:1000]}
-Normalized: {normalized[:500]}
----
-Is this SPAM or OK?"""
+        prompt = f"Analyze this message:\n\n{text[:1500]}"
         
         response = await asyncio.wait_for(
             ai_model.generate_content_async(prompt),
             timeout=timeout
         )
         
-        decision = (response.text or "").strip().upper()
+        result = (response.text or "").strip().upper()
         
-        if "SPAM" in decision:
-            return True, "AI detected spam content"
-        elif "OK" in decision:
-            return False, ""
-        
+        if "ILLEGAL" in result:
+            return "ILLEGAL"
+        elif "SPAM" in result:
+            return "SPAM"
+        else:
+            return "OK"
+    
     except asyncio.TimeoutError:
-        logger.debug("AI timeout")
+        logger.debug("AI timeout - allowing message")
+        return "OK"
     except Exception as e:
         logger.debug(f"AI error: {e}")
-    
-    return None, ""
+        return "OK"
 
 
 # ============================================================
-# Spam Detection Patterns (Precompiled)
+# Flood Detection (Fast, No AI needed)
 # ============================================================
 
-SPAM_PATTERNS: List[Tuple[re.Pattern, int, str]] = [
-    # High severity - Illegal content
-    (re.compile(r"\b(child|kid|minor)\s*(porn|sex|nude|cp)\b", re.I), 100, "Illegal content"),
-    (re.compile(r"\bpedo(phile)?\b", re.I), 100, "Illegal content"),
-    (re.compile(r"\b(csam|cp)\b", re.I), 100, "Illegal content"),
-    (re.compile(r"\bunderage\b", re.I), 80, "Potential illegal content"),
+def check_flood(user_id: int, text: str, settings: Settings) -> Tuple[bool, str]:
+    """Check if user is flooding"""
+    now = time.time()
     
-    # Medium-High severity - Adult/Explicit
-    (re.compile(r"\b(desi|indian|tamil|chinese|arabian)\s*cp\b", re.I), 100, "Illegal content"),
-    (re.compile(r"\b(bro-?sis|dad-?daughter|mom-?son)\s*(cp|porn|video)\b", re.I), 100, "Illegal content"),
-    (re.compile(r"\bpremium\s*(cp|collection|content)\b", re.I), 90, "Illegal spam"),
+    # Clean old timestamps
+    cutoff = now - settings.flood_time_window
+    state.user_messages[user_id] = [
+        t for t in state.user_messages[user_id] if t > cutoff
+    ]
     
-    # Medium severity - Commerce/Promotion
-    (re.compile(r"\blowest\s*price\b", re.I), 60, "Commercial spam"),
-    (re.compile(r"\bdm\s*(for|me)\s*(purchase|price|deal)\b", re.I), 70, "Commercial spam"),
-    (re.compile(r"\bpayment\s*(method|available)\b", re.I), 50, "Commercial spam"),
-    (re.compile(r"\b(upi|paypal|crypto|bitcoin|usdt)\s*(payment|accepted|only)\b", re.I), 60, "Payment spam"),
-    (re.compile(r"\b(combo|collection)\s*(available|price)\b", re.I), 55, "Commercial spam"),
-    (re.compile(r"\bprice\s*(available|list|dm)\b", re.I), 50, "Commercial spam"),
+    # Add current
+    state.user_messages[user_id].append(now)
     
-    # Scam patterns
-    (re.compile(r"\b(earn|make)\s*(money|income|₹|\$)\s*(online|daily|weekly)\b", re.I), 65, "Scam"),
-    (re.compile(r"\bguaranteed\s*(profit|return|income)\b", re.I), 70, "Investment scam"),
-    (re.compile(r"\bdouble\s*your\s*(money|investment|crypto)\b", re.I), 80, "Investment scam"),
-    (re.compile(r"\bwork\s*from\s*home\s*(job|income|opportunity)\b", re.I), 45, "Potential scam"),
-    (re.compile(r"\b(join|contact)\s*(whatsapp|telegram)\s*(group|channel|link)\b", re.I), 40, "Promotion"),
+    # Check message count
+    if len(state.user_messages[user_id]) > settings.flood_messages_limit:
+        return True, f"Flooding: {len(state.user_messages[user_id])} messages in {settings.flood_time_window}s"
     
-    # Adult services
-    (re.compile(r"\b(escort|call\s*girl|sex\s*service)\b", re.I), 75, "Adult service spam"),
-    (re.compile(r"\bvideo\s*call\s*(available|service)\b", re.I), 55, "Adult service spam"),
-    (re.compile(r"\b(nude|naked)\s*(pic|photo|video|content)\b", re.I), 60, "Adult content"),
-    (re.compile(r"\bonlyfans\.com\b", re.I), 50, "Adult platform"),
+    # Check duplicate messages
+    text_hash = hashlib.md5(text.lower().encode()).hexdigest()[:16]
     
-    # Crypto scams
-    (re.compile(r"\b(airdrop|giveaway)\s*(crypto|btc|eth|token)\b", re.I), 55, "Crypto scam"),
-    (re.compile(r"\bfree\s*(crypto|bitcoin|ethereum|token)\b", re.I), 60, "Crypto scam"),
-    (re.compile(r"\b(invest|deposit)\s*(now|today)\s*(and|to)\s*(get|earn)\b", re.I), 65, "Investment scam"),
-]
-
-# Link/URL detection
-URL_PATTERN = re.compile(
-    r'(?:https?://|www\.)[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*',
-    re.IGNORECASE
-)
-
-HIDDEN_URL_PATTERNS = [
-    re.compile(r'\b\w+\s*\.\s*\w+\s*/\s*\w+', re.I),  # spaced out URLs
-    re.compile(r'\b\w+\[?\.\]?\w+\[?\.\]?(?:com|org|net|io|xyz|me)\b', re.I),  # obfuscated TLDs
-    re.compile(r't\s*\.\s*me\s*/\s*\w+', re.I),  # Telegram links
-    re.compile(r'bit\s*\.\s*ly', re.I),  # URL shorteners
-]
-
-# Telegram entities that indicate links/mentions
-URL_ENTITY_TYPES = {"url", "text_link"}
-MENTION_ENTITY_TYPES = {"mention", "text_mention"}
-
-# Emojis commonly used in spam
-SPAM_EMOJIS = {'💰', '🤑', '💵', '💸', '🔥', '💯', '⬇️', '👇', '📣', '🚀', '💎', '🟢', '🔴', '⚡', '✅', '❌'}
-
-# Normalization patterns
-NORMALIZE_PATTERNS = [
-    (re.compile(r'[^\w\s@.\-$₹€£]'), ' '),  # Remove special chars
-    (re.compile(r'\s+'), ' '),  # Collapse whitespace
-]
-
-LEET_SPEAK_MAP = {
-    '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's',
-    '7': 't', '@': 'a', '$': 's', '!': 'i', '|': 'l',
-}
+    if state.user_last_text.get(user_id) == text_hash:
+        state.user_repeat_count[user_id] += 1
+        if state.user_repeat_count[user_id] >= 3:
+            return True, "Duplicate message spam"
+    else:
+        state.user_last_text[user_id] = text_hash
+        state.user_repeat_count[user_id] = 1
+    
+    return False, ""
 
 
 # ============================================================
-# Utility Functions
+# Helper Functions
 # ============================================================
-
-def normalize_text(text: str) -> str:
-    """Normalize text for spam detection"""
-    result = text.lower()
-    
-    # Convert leet speak
-    for leet, normal in LEET_SPEAK_MAP.items():
-        result = result.replace(leet, normal)
-    
-    # Apply normalization patterns
-    for pattern, replacement in NORMALIZE_PATTERNS:
-        result = pattern.sub(replacement, result)
-    
-    return result.strip()
-
-
-def get_message_hash(text: str) -> str:
-    """Get hash of message for duplicate detection"""
-    normalized = normalize_text(text)
-    return hashlib.md5(normalized.encode()).hexdigest()[:16]
-
-
-def count_emojis(text: str) -> int:
-    """Count emojis in text"""
-    emoji_pattern = re.compile(
-        "["
-        "\U0001F600-\U0001F64F"
-        "\U0001F300-\U0001F5FF"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F1E0-\U0001F1FF"
-        "\U00002702-\U000027B0"
-        "\U000024C2-\U0001F251"
-        "]+",
-        flags=re.UNICODE
-    )
-    return len(emoji_pattern.findall(text))
-
-
-def count_spam_emojis(text: str) -> int:
-    """Count spam-associated emojis"""
-    return sum(1 for char in text if char in SPAM_EMOJIS)
-
 
 def is_admin(user_id: int, settings: Settings) -> bool:
-    """Check if user is admin"""
     return user_id in settings.admin_user_ids
 
 
 def is_trusted(user_id: int) -> bool:
-    """Check if user is trusted"""
     return user_id in state.trusted_users
 
 
-def is_owner_channel(chat_id: int) -> bool:
-    """Check if this is the owner's channel"""
-    return chat_id == OWNER_CHANNEL_ID
-
-
 def is_allowed_channel(channel_id: int) -> bool:
-    """Check if channel is in allowed list"""
-    return channel_id in state.allowed_channels or channel_id == OWNER_CHANNEL_ID
+    return channel_id in state.allowed_channels
 
 
-# ============================================================
-# Message Deletion & Actions
-# ============================================================
-
-async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> bool:
-    """Safely delete a message, handling errors gracefully"""
+async def safe_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int) -> bool:
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         return True
-    except BadRequest as e:
-        if "message to delete not found" in str(e).lower():
-            return True  # Already deleted
-        if "message can't be deleted" in str(e).lower():
-            logger.debug(f"Cannot delete message {message_id} in {chat_id}")
-        return False
-    except Forbidden:
-        logger.warning(f"No permission to delete in chat {chat_id}")
+    except (BadRequest, Forbidden):
         return False
     except Exception as e:
-        logger.error(f"Delete error for {message_id} in {chat_id}: {e}")
+        logger.debug(f"Delete error: {e}")
         return False
 
 
-async def delete_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
-    """Delete message after a delay"""
+async def delete_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, msg_id: int, delay: int):
     await asyncio.sleep(delay)
-    await safe_delete_message(context, chat_id, message_id)
+    await safe_delete(context, chat_id, msg_id)
 
 
-async def send_ephemeral(
-    update: Update,
+async def send_temp_message(
     context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
     text: str,
-    settings: Settings,
-    include_promo: bool = False
-) -> Optional[Message]:
-    """Send a message that auto-deletes after delay"""
-    if not update.effective_message:
-        return None
-    
-    final_text = text
-    if include_promo and settings.promotion_text:
-        final_text = f"{text}\n\n{settings.promotion_text}"
-    
+    delay: int
+) -> None:
+    """Send a message that auto-deletes"""
     try:
-        msg = await update.effective_message.reply_text(
-            final_text,
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True
         )
-        context.application.create_task(
-            delete_after_delay(context, update.effective_chat.id, msg.message_id, settings.deletion_delay_sec)
-        )
-        return msg
+        asyncio.create_task(delete_later(context, chat_id, msg.message_id, delay))
     except Exception as e:
-        logger.error(f"Failed to send ephemeral: {e}")
-        return None
-
-
-async def log_action(
-    context: ContextTypes.DEFAULT_TYPE,
-    action_type: str,
-    user_id: int,
-    chat_id: int,
-    details: Dict[str, Any],
-    settings: Settings
-) -> None:
-    """Log action to database and optionally to log channel"""
-    assert db is not None
-    
-    try:
-        db.execute(
-            """INSERT INTO action_logs (action_type, user_id, chat_id, details, performed_by)
-               VALUES (%s, %s, %s, %s, %s);""",
-            (action_type, user_id, chat_id, json.dumps(details), 0)
-        )
-    except Exception as e:
-        logger.error(f"Failed to log action: {e}")
-    
-    # Send to log channel if configured
-    if settings.log_channel_id:
-        try:
-            log_text = f"""📋 <b>Action Log</b>
-Type: {action_type}
-User: <code>{user_id}</code>
-Chat: <code>{chat_id}</code>
-Details: {json.dumps(details, indent=2)[:500]}
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
-            
-            await context.bot.send_message(
-                chat_id=settings.log_channel_id,
-                text=log_text,
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            logger.debug(f"Failed to send to log channel: {e}")
-
-
-# ============================================================
-# Spam Detection Engine
-# ============================================================
-
-async def analyze_message(
-    msg: Message,
-    text: str,
-    settings: Settings
-) -> SpamScore:
-    """Comprehensive spam analysis returning a score"""
-    score = SpamScore()
-    
-    if not text:
-        return score
-    
-    text_lower = text.lower()
-    normalized = normalize_text(text)
-    
-    entities = list(msg.entities or []) + list(msg.caption_entities or [])
-    
-    # ===== Level 1: Entity-based checks =====
-    
-    # Check for URLs (not in admin messages)
-    url_count = sum(1 for e in entities if e.type in URL_ENTITY_TYPES)
-    if url_count > 0:
-        score.add(30 * url_count, f"Contains {url_count} link(s)")
-    
-    # Check for mentions
-    mention_count = sum(1 for e in entities if e.type in MENTION_ENTITY_TYPES)
-    if mention_count > 2:
-        score.add(20, f"Multiple mentions ({mention_count})")
-    
-    # ===== Level 2: Pattern matching =====
-    
-    # Check hardcoded patterns
-    for pattern, points, reason in SPAM_PATTERNS:
-        if pattern.search(text_lower) or pattern.search(normalized):
-            score.add(points, reason)
-            if points >= 80:  # High severity - stop checking
-                return score
-    
-    # Check custom patterns from DB
-    for pattern in state.custom_spam_patterns:
-        if pattern.search(text_lower) or pattern.search(normalized):
-            score.add(40, "Matched custom pattern")
-    
-    # ===== Level 3: Blacklist check =====
-    
-    # High severity blacklist
-    for word in state.blacklist_high_severity:
-        if word in text_lower or word in normalized:
-            score.add(70, f"High-severity blacklisted term: {word[:20]}")
-            return score
-    
-    # Regular blacklist
-    blacklist_matches = sum(1 for w in state.blacklist_words if w in text_lower or w in normalized)
-    if blacklist_matches > 0:
-        score.add(15 * blacklist_matches, f"Blacklisted terms: {blacklist_matches}")
-    
-    # ===== Level 4: Heuristic checks =====
-    
-    # Hidden URLs
-    for pattern in HIDDEN_URL_PATTERNS:
-        if pattern.search(text):
-            score.add(25, "Hidden/obfuscated URL detected")
-            break
-    
-    # Excessive emojis
-    emoji_count = count_emojis(text)
-    if emoji_count > settings.max_emojis_allowed:
-        score.add(15, f"Excessive emojis ({emoji_count})")
-    
-    # Spam emojis
-    spam_emoji_count = count_spam_emojis(text)
-    if spam_emoji_count > 3:
-        score.add(20, f"Spam emojis ({spam_emoji_count})")
-    
-    # Very long messages
-    if len(text) > settings.max_message_length:
-        score.add(10, "Excessively long message")
-    
-    # ALL CAPS (more than 70% uppercase for messages > 20 chars)
-    if len(text) > 20:
-        alpha_chars = [c for c in text if c.isalpha()]
-        if alpha_chars:
-            upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
-            if upper_ratio > 0.7:
-                score.add(15, "Excessive CAPS")
-    
-    # Repeated characters (like "hiiiiiiii")
-    if re.search(r'(.)\1{4,}', text):
-        score.add(10, "Character repetition")
-    
-    return score
-
-
-async def check_flood(user_id: int, text: str, settings: Settings) -> Tuple[bool, str]:
-    """Check if user is flooding"""
-    now = time.time()
-    flood_data = state.user_flood_data[user_id]
-    
-    # Clean old timestamps
-    cutoff = now - settings.flood_time_window
-    flood_data.message_times = [t for t in flood_data.message_times if t > cutoff]
-    
-    # Add current timestamp
-    flood_data.message_times.append(now)
-    
-    # Check flood by message count
-    if len(flood_data.message_times) > settings.flood_messages_limit:
-        return True, f"Flooding ({len(flood_data.message_times)} messages in {settings.flood_time_window}s)"
-    
-    # Check duplicate messages
-    msg_hash = get_message_hash(text)
-    if msg_hash == flood_data.last_message_hash:
-        flood_data.duplicate_count += 1
-        if flood_data.duplicate_count >= 3:
-            return True, f"Duplicate message flood ({flood_data.duplicate_count} times)"
-    else:
-        flood_data.last_message_hash = msg_hash
-        flood_data.duplicate_count = 1
-    
-    return False, ""
+        logger.debug(f"Send error: {e}")
 
 
 # ============================================================
@@ -1060,21 +517,14 @@ async def check_flood(user_id: int, text: str, settings: Settings) -> Tuple[bool
 # ============================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Main message handler with comprehensive spam detection"""
     settings: Settings = context.bot_data["settings"]
     
-    # ===== CHANNEL POST HANDLING =====
-    # Check for channel posts FIRST - Owner channel posts are NEVER deleted
+    # ===== CHANNEL POSTS =====
     if update.channel_post:
         channel = update.channel_post.chat
-        if channel and is_owner_channel(channel.id):
-            logger.debug(f"✅ Owner channel post allowed: {channel.id}")
-            return
         if channel and is_allowed_channel(channel.id):
-            logger.debug(f"✅ Allowed channel post: {channel.id}")
-            return
-        # Unknown channel - ignore (don't process as spam)
-        return
+            return  # Allow
+        return  # Ignore other channels
     
     msg = update.effective_message
     if not msg:
@@ -1089,7 +539,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = chat.id
     user_id = user.id
     
-    # ===== ALLOWLIST CHECKS =====
+    # ===== QUICK BYPASSES =====
     
     # Only process allowed chats
     if chat_id not in state.allowed_chats:
@@ -1107,175 +557,143 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if is_trusted(user_id):
         return
     
-    # Update stats
     state.messages_processed += 1
     
-    # ===== FORWARD HANDLING (Updated for v21+) =====
-    # Check forwarded messages using forward_origin
+    # ===== FORWARD CHECK =====
     forward_origin = getattr(msg, "forward_origin", None)
-    is_forward = forward_origin is not None
     
-    forward_from_chat = None
-    forward_from_user = None
-
-    if is_forward:
-        # Extract Chat/Channel info
-        if hasattr(forward_origin, "chat"): # Origin is a Channel
-            forward_from_chat = forward_origin.chat
-        elif hasattr(forward_origin, "sender_chat"): # Origin is an anonymous Chat
-            forward_from_chat = forward_origin.sender_chat
-            
-        # Extract User info
-        if hasattr(forward_origin, "sender_user"): # Origin is a User
-            forward_from_user = forward_origin.sender_user
-
-    if is_forward:
-        # Allow forwards from owner channel
-        if forward_from_chat and is_owner_channel(forward_from_chat.id):
-            logger.debug(f"✅ Forward from owner channel allowed")
-            return
+    if forward_origin:
+        # Check if from allowed channel
+        forward_chat = getattr(forward_origin, "chat", None) or getattr(forward_origin, "sender_chat", None)
         
-        # Allow forwards from allowed channels
-        if forward_from_chat and is_allowed_channel(forward_from_chat.id):
-            logger.debug(f"✅ Forward from allowed channel: {forward_from_chat.id}")
-            return
+        if forward_chat and is_allowed_channel(forward_chat.id):
+            return  # Allow forwards from allowed channels
         
-        # Allow forwards from whitelisted users
-        # Note: forward_whitelist checks the person SENDING the message, not the original author
-        if user_id in state.forward_whitelist_users:
-            logger.debug(f"✅ Forward allowed for whitelisted user: {user_id}")
-            return
+        # Check if user has forward permission
+        if user_id in state.forward_whitelist:
+            return  # Allow
         
-        # Block unauthorized forwards
-        await enforce_spam(
-            context, chat_id, user_id, msg,
-            "Forwarding is not allowed without permission",
-            50, settings
+        # Block unauthorized forward
+        await safe_delete(context, chat_id, msg.message_id)
+        state.spam_blocked += 1
+        
+        await send_temp_message(
+            context, chat_id,
+            f"⚠️ <a href='tg://user?id={user_id}'>User</a>, forwarding not allowed.\n\n{settings.promotion_text}",
+            settings.deletion_delay_sec
         )
         return
     
-    # ===== RATE LIMITING =====
-    now_ts = time.time()
-    rate_key = (user_id, chat_id)
-    last_ts = state.message_rate_limit_ts.get(rate_key, 0.0)
-    
-    if now_ts - last_ts < settings.min_seconds_between_msgs:
-        await safe_delete_message(context, chat_id, msg.message_id)
-        return
-    
-    state.message_rate_limit_ts[rate_key] = now_ts
-    
-    # ===== GET TEXT CONTENT =====
+    # ===== GET TEXT =====
     text = msg.text or msg.caption or ""
     
-    # ===== FLOOD CHECK =====
-    if text:
-        is_flood, flood_reason = await check_flood(user_id, text, settings)
-        if is_flood:
-            await enforce_spam(context, chat_id, user_id, msg, flood_reason, 60, settings)
-            return
+    if not text:
+        return  # Allow media without caption
     
-    # ===== SPAM ANALYSIS =====
-    score = await analyze_message(msg, text, settings)
+    # ===== FLOOD CHECK (Fast, no AI) =====
+    is_flood, flood_reason = check_flood(user_id, text, settings)
     
-    # ===== AI CHECK (Final stage for borderline cases) =====
-    if settings.ai_enabled and text and 20 <= score.score < 50:
-        ai_result, ai_reason = await ai_check_spam(text, normalize_text(text), settings.ai_timeout_sec)
-        if ai_result is True:
-            score.add(40, ai_reason)
+    if is_flood:
+        await take_action(context, settings, chat_id, user_id, msg, "SPAM", flood_reason)
+        return
     
-    # ===== ENFORCE IF SPAM =====
-    if score.is_spam():
-        reason = "; ".join(score.reasons[:3])  # Top 3 reasons
-        await enforce_spam(context, chat_id, user_id, msg, reason, score.score, settings)
+    # ===== AI ANALYSIS =====
+    verdict = await ai_analyze(text, settings.ai_timeout_sec)
+    
+    if verdict in ("SPAM", "ILLEGAL"):
+        await take_action(context, settings, chat_id, user_id, msg, verdict, "AI Detection")
         
-        # Log the action
-        await log_action(context, "SPAM_DETECTED", user_id, chat_id, {
-            "score": score.score,
-            "reasons": score.reasons,
-            "text_preview": text[:100] if text else ""
-        }, settings)
+        # Log to database
+        if db:
+            try:
+                db.execute(
+                    "INSERT INTO spam_log (user_id, chat_id, message_text, ai_verdict, action_taken) VALUES (%s, %s, %s, %s, %s);",
+                    (user_id, chat_id, text[:500], verdict, "DELETE" if verdict == "SPAM" else "BAN")
+                )
+            except:
+                pass
 
 
-async def enforce_spam(
+async def take_action(
     context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
     chat_id: int,
     user_id: int,
     msg: Message,
-    reason: str,
-    severity: int,
-    settings: Settings
+    verdict: str,
+    reason: str
 ) -> None:
-    """Enforce spam action - delete message and warn/ban user"""
+    """Take action based on verdict"""
     
-    # Delete the spam message
-    await safe_delete_message(context, chat_id, msg.message_id)
+    # Delete message
+    await safe_delete(context, chat_id, msg.message_id)
+    state.spam_blocked += 1
     
-    # Update stats
-    state.spam_detected += 1
-    
-    # Increment warnings
-    state.user_warnings[user_id] = state.user_warnings.get(user_id, 0) + 1
-    warning_count = state.user_warnings[user_id]
-    
-    # High severity = immediate action
-    if severity >= 80:
-        warning_count = state.max_warnings  # Force ban
-    
-    if warning_count >= state.max_warnings:
-        # BAN USER
+    if verdict == "ILLEGAL":
+        # Instant ban
         try:
             await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
             state.users_banned += 1
             
-            # Store in DB
             if db:
                 try:
                     db.execute(
-                        """INSERT INTO banned_users (user_id, chat_id, reason, banned_by)
-                           VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING;""",
-                        (user_id, chat_id, reason[:500], 0)
+                        "INSERT INTO banned_users (user_id, chat_id, reason) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
+                        (user_id, chat_id, reason)
                     )
-                except Exception:
+                except:
                     pass
-            
         except Exception as e:
-            logger.warning(f"Ban failed for {user_id}: {e}")
+            logger.warning(f"Ban failed: {e}")
         
-        warning_text = f"""🚫 <b>User Banned</b>
-
-<a href='tg://user?id={user_id}'>User</a> has been banned after {state.max_warnings} warnings.
-
-Reason: {reason[:200]}
-
-{settings.promotion_text}"""
+        await send_temp_message(
+            context, chat_id,
+            f"🚫 <a href='tg://user?id={user_id}'>User</a> <b>BANNED</b>\nReason: Illegal content detected",
+            settings.deletion_delay_sec
+        )
         
         state.user_warnings.pop(user_id, None)
-        logger.info(f"🚫 Banned user {user_id} | Reason: {reason}")
-    else:
-        # WARNING
-        warning_text = f"""⚠️ <b>Warning {warning_count}/{state.max_warnings}</b>
-
-<a href='tg://user?id={user_id}'>User</a>, your message was removed.
-
-Reason: {reason[:200]}
-
-{settings.promotion_text}"""
-        
-        logger.info(f"⚠️ Warning {warning_count} to {user_id} | Reason: {reason}")
+        logger.info(f"🚫 BANNED {user_id} | Reason: {reason}")
+        return
     
-    try:
-        sent = await context.bot.send_message(
-            chat_id=chat_id,
-            text=warning_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
+    # SPAM - Warning system
+    state.user_warnings[user_id] = state.user_warnings.get(user_id, 0) + 1
+    warnings = state.user_warnings[user_id]
+    
+    if warnings >= state.max_warnings:
+        # Ban after max warnings
+        try:
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+            state.users_banned += 1
+            
+            if db:
+                try:
+                    db.execute(
+                        "INSERT INTO banned_users (user_id, chat_id, reason) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;",
+                        (user_id, chat_id, f"Max warnings reached: {reason}")
+                    )
+                except:
+                    pass
+        except Exception as e:
+            logger.warning(f"Ban failed: {e}")
+        
+        await send_temp_message(
+            context, chat_id,
+            f"🚫 <a href='tg://user?id={user_id}'>User</a> <b>BANNED</b>\n{state.max_warnings} warnings reached.\n\n{settings.promotion_text}",
+            settings.deletion_delay_sec
         )
-        context.application.create_task(
-            delete_after_delay(context, chat_id, sent.message_id, settings.deletion_delay_sec)
+        
+        state.user_warnings.pop(user_id, None)
+        logger.info(f"🚫 BANNED {user_id} | Warnings exceeded")
+    else:
+        # Warning
+        await send_temp_message(
+            context, chat_id,
+            f"⚠️ <b>Warning {warnings}/{state.max_warnings}</b>\n\n<a href='tg://user?id={user_id}'>User</a>, message removed.\nReason: {reason}\n\n{settings.promotion_text}",
+            settings.deletion_delay_sec
         )
-    except Exception as e:
-        logger.error(f"Failed to send warning: {e}")
+        
+        logger.info(f"⚠️ Warning {warnings} to {user_id} | {reason}")
 
 
 # ============================================================
@@ -1283,250 +701,114 @@ Reason: {reason[:200]}
 # ============================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start command handler"""
     await update.message.reply_text(
         f"""🛡️ <b>Guardian Bot v{BOT_VERSION}</b>
 
-I protect Telegram groups from spam, scams, and unwanted content.
+AI-Powered Protection for Telegram Groups
 
 <b>Features:</b>
-• Multi-layer spam detection
-• AI-powered analysis
-• Flood protection
-• Forward control
-• Customizable blacklist
-• Warning system
+• 🤖 Smart AI spam detection
+• 🌍 All languages supported
+• 🎬 Movie requests allowed
+• 💬 Normal chat protected
+• 🚫 Spam/Scam blocked
+• ⛔ Illegal content = instant ban
 
-Use /help for admin commands.""",
+Use /help for commands.""",
         parse_mode=ParseMode.HTML
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Help command for admins"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ This command is for admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    help_text = f"""🛡️ <b>Guardian Bot Admin Commands</b>
-
-<b>📝 Blacklist Management:</b>
-/addword &lt;word1&gt; &lt;word2&gt; ... - Add blacklist words
-/removeword &lt;word&gt; - Remove word from blacklist
-/listwords - Show all blacklisted words
+    await update.message.reply_text(
+        f"""🛡️ <b>Admin Commands</b>
 
 <b>💬 Chat Management:</b>
-/allowchat &lt;chat_id&gt; - Allow a chat
+/allowchat &lt;id&gt; - Allow a chat
 /allowthischat - Allow current chat
-/removechat &lt;chat_id&gt; - Remove allowed chat
-/listchats - List all allowed chats
+/removechat &lt;id&gt; - Remove chat
+/listchats - List allowed chats
 
 <b>📢 Channel Management:</b>
-/allowchannel &lt;channel_id&gt; - Allow channel to post/forward
-/removechannel &lt;channel_id&gt; - Remove allowed channel
-/listchannels - List allowed channels
+/allowchannel &lt;id&gt; - Allow channel
+/removechannel &lt;id&gt; - Remove channel
+/listchannels - List channels
 
 <b>↗️ Forward Control:</b>
 /allowforward &lt;user_id&gt; - Allow user to forward
-/revokeforward &lt;user_id&gt; - Revoke forward permission
-/listforwarders - List users with forward permission
+/revokeforward &lt;user_id&gt; - Revoke forward
+/listforwarders - List forwarders
 
 <b>👤 User Management:</b>
-/trust &lt;user_id&gt; - Add trusted user (bypasses all checks)
-/untrust &lt;user_id&gt; - Remove trusted user
-/listtrused - List trusted users
-/warn &lt;user_id&gt; - Manually warn a user
-/ban &lt;user_id&gt; - Ban a user
-/unban &lt;user_id&gt; - Unban a user
-/resetwarnings &lt;user_id&gt; - Reset user warnings
+/trust &lt;user_id&gt; - Trust user (bypass all)
+/untrust &lt;user_id&gt; - Remove trust
+/listtrusted - List trusted users
+/warn &lt;user_id&gt; - Warn user
+/ban &lt;user_id&gt; - Ban user
+/unban &lt;user_id&gt; - Unban user
+/resetwarnings &lt;user_id&gt; - Reset warnings
 
 <b>⚙️ Settings:</b>
-/setmaxwarnings &lt;n&gt; - Set warning threshold (Current: {state.max_warnings})
-/addpattern &lt;pattern&gt; - Add custom spam pattern
-/removepattern &lt;pattern&gt; - Remove spam pattern
+/setwarnings &lt;n&gt; - Set max warnings
+/reload - Reload data
 
 <b>📊 Info:</b>
-/stats - View bot statistics
-/status - Bot status
-/reload - Reload all caches
-/botversion - Version info
-
-<b>Owner Channel:</b> <code>{OWNER_CHANNEL_ID}</code> (always allowed)"""
-    
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+/stats - View statistics
+/status - Bot status""",
+        parse_mode=ParseMode.HTML
+    )
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show bot statistics with DEBUG info"""
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id
     
-    # --- DEBUGGING LINE START ---
-    print(f"DEBUG: User trying command: {user_id} (Type: {type(user_id)})")
-    print(f"DEBUG: Configured Admins: {settings.admin_user_ids} (Type: {type(settings.admin_user_ids)})")
-    # --- DEBUGGING LINE END ---
-
-    if not is_admin(user_id, settings):
-        # Yahan hum ID ko Telegram chat mein hi print karwa rahe hain
-        msg = f"❌ Admins only.\n\n🤖 Bot sees your ID as: <code>{user_id}</code>\n⚙️ Configured Admin: <code>{settings.admin_user_ids}</code>"
-        await send_ephemeral(update, context, msg, settings)
+    if not is_admin(update.effective_user.id, settings):
+        await update.message.reply_text(f"❌ Admins only.\nYour ID: <code>{update.effective_user.id}</code>", parse_mode=ParseMode.HTML)
         return
+    
+    uptime = str(datetime.now() - state.start_time).split('.')[0]
+    
+    await update.message.reply_text(
+        f"""📊 <b>Guardian Bot Stats</b>
 
-    # Baaki ka code same rahega
-    uptime = datetime.now() - state.start_time
-    uptime_str = str(uptime).split('.')[0]
-    
-    stats_text = f"""📊 <b>Guardian Bot Statistics</b>
-    
-<b>📈 Activity:</b>
-• Messages processed: {state.messages_processed:,}
-• Spam detected: {state.spam_detected:,}
+<b>Activity:</b>
+• Messages: {state.messages_processed:,}
+• Spam blocked: {state.spam_blocked:,}
 • Users banned: {state.users_banned:,}
 • Active warnings: {len(state.user_warnings)}
 
-<b>⚙️ Configuration:</b>
-• Admin ID Match: ✅ Yes
-• Bot Version: {BOT_VERSION}
-• Uptime: {uptime_str}"""
+<b>Config:</b>
+• Chats: {len(state.allowed_chats)}
+• Channels: {len(state.allowed_channels)}
+• Trusted: {len(state.trusted_users)}
+• Max warnings: {state.max_warnings}
 
-    await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Quick status check"""
-    settings: Settings = context.bot_data["settings"]
-    
-    await update.message.reply_text(
-        f"""✅ <b>Guardian Bot is Active</b>
-
-Version: {BOT_VERSION}
-AI: {'🟢 ON' if settings.ai_enabled else '🔴 OFF'}
-Processed: {state.messages_processed:,} messages
-Spam blocked: {state.spam_detected:,}""",
+<b>System:</b>
+• Version: {BOT_VERSION}
+• AI: {'🟢 ON' if ai_model else '🔴 OFF'}
+• Uptime: {uptime}""",
         parse_mode=ParseMode.HTML
     )
 
 
-async def cmd_botversion(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show bot version"""
+async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"🛡️ Guardian Bot v{BOT_VERSION}\n\nUltra Powerful Edition with AI spam detection",
+        f"✅ Guardian Bot v{BOT_VERSION}\nAI: {'🟢' if ai_model else '🔴'}\nSpam blocked: {state.spam_blocked:,}",
         parse_mode=ParseMode.HTML
     )
-
-
-async def cmd_addword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add words to blacklist"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
-        return
-    
-    if not context.args:
-        await send_ephemeral(update, context, "Usage: /addword word1 word2 ...", settings)
-        return
-    
-    words = {w.lower().strip() for w in context.args if w.strip()}
-    added = 0
-    
-    for word in words:
-        try:
-            db.execute(
-                "INSERT INTO blacklist (word, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
-                (word, update.effective_user.id)
-            )
-            added += 1
-            state.blacklist_words.add(word)
-        except Exception as e:
-            logger.error(f"Failed to add word '{word}': {e}")
-    
-    await update.message.reply_text(f"✅ Added {added} word(s) to blacklist")
-    logger.info(f"Admin {update.effective_user.id} added {added} blacklist words")
-
-
-async def cmd_removeword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove word from blacklist"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
-        return
-    
-    if not context.args:
-        await send_ephemeral(update, context, "Usage: /removeword word", settings)
-        return
-    
-    word = context.args[0].lower().strip()
-    
-    try:
-        db.execute("DELETE FROM blacklist WHERE word = %s;", (word,))
-        state.blacklist_words.discard(word)
-        state.blacklist_high_severity.discard(word)
-        await update.message.reply_text(f"✅ Removed '{word}' from blacklist")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_listwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List blacklisted words"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
-        return
-    
-    if not state.blacklist_words:
-        await update.message.reply_text("No blacklisted words.")
-        return
-    
-    words_list = sorted(state.blacklist_words)[:100]  # Limit to 100
-    words_text = ", ".join(words_list)
-    
-    if len(state.blacklist_words) > 100:
-        words_text += f"\n\n... and {len(state.blacklist_words) - 100} more"
-    
-    await update.message.reply_text(f"📝 <b>Blacklisted Words ({len(state.blacklist_words)}):</b>\n\n{words_text}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow a chat by ID"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, f"❌ Admins only. Your ID: {update.effective_user.id}", settings)
-        return
-    
-    if not context.args:
-        await send_ephemeral(update, context, "Usage: /allowchat <chat_id>", settings)
-        return
-    
-    try:
-        chat_id = int(context.args[0])
-    except ValueError:
-        await send_ephemeral(update, context, "❌ Invalid chat ID", settings)
-        return
-    
-    try:
-        db.execute(
-            "INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
-            (chat_id, update.effective_user.id)
-        )
-        state.allowed_chats.add(chat_id)
-        await update.message.reply_text(f"✅ Chat {chat_id} is now allowed")
-        logger.info(f"Chat {chat_id} allowed by admin {update.effective_user.id}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow current chat"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     chat_id = update.effective_chat.id
@@ -1538,528 +820,406 @@ async def cmd_allowthischat(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             (chat_id, chat_title, update.effective_user.id, chat_title)
         )
         state.allowed_chats.add(chat_id)
-        await update.message.reply_text(f"✅ This chat is now protected!\n\nChat ID: <code>{chat_id}</code>", parse_mode=ParseMode.HTML)
-        logger.info(f"Chat {chat_id} ({chat_title}) allowed by admin {update.effective_user.id}")
+        await update.message.reply_text(f"✅ Chat protected!\nID: <code>{chat_id}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_allowchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.bot_data["settings"]
+    
+    if not is_admin(update.effective_user.id, settings):
+        await update.message.reply_text("❌ Admins only.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /allowchat <chat_id>")
+        return
+    
+    try:
+        chat_id = int(context.args[0])
+        db.execute(
+            "INSERT INTO allowed_chats (chat_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+            (chat_id, update.effective_user.id)
+        )
+        state.allowed_chats.add(chat_id)
+        await update.message.reply_text(f"✅ Chat {chat_id} allowed")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid chat ID")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_removechat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove chat from allowed list"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not context.args:
-        await send_ephemeral(update, context, "Usage: /removechat <chat_id>", settings)
+        await update.message.reply_text("Usage: /removechat <chat_id>")
         return
     
     try:
         chat_id = int(context.args[0])
-    except ValueError:
-        await send_ephemeral(update, context, "❌ Invalid chat ID", settings)
-        return
-    
-    try:
         db.execute("DELETE FROM allowed_chats WHERE chat_id = %s;", (chat_id,))
         state.allowed_chats.discard(chat_id)
-        await update.message.reply_text(f"✅ Chat {chat_id} removed from protection")
+        await update.message.reply_text(f"✅ Chat {chat_id} removed")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_listchats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List allowed chats"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not state.allowed_chats:
-        await update.message.reply_text("No chats are currently allowed.")
+        await update.message.reply_text("No allowed chats.")
         return
     
-    chats_text = "\n".join(f"• <code>{cid}</code>" for cid in sorted(state.allowed_chats))
-    await update.message.reply_text(f"💬 <b>Allowed Chats ({len(state.allowed_chats)}):</b>\n\n{chats_text}", parse_mode=ParseMode.HTML)
+    chats = "\n".join(f"• <code>{c}</code>" for c in state.allowed_chats)
+    await update.message.reply_text(f"💬 <b>Allowed Chats:</b>\n\n{chats}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_allowchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow a channel"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not context.args:
-        await send_ephemeral(update, context, "Usage: /allowchannel <channel_id>", settings)
+        await update.message.reply_text("Usage: /allowchannel <channel_id>")
         return
     
     try:
         channel_id = int(context.args[0])
-    except ValueError:
-        await send_ephemeral(update, context, "❌ Invalid channel ID", settings)
-        return
-    
-    try:
         db.execute(
             "INSERT INTO allowed_channels (channel_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
             (channel_id, update.effective_user.id)
         )
         state.allowed_channels.add(channel_id)
-        await update.message.reply_text(f"✅ Channel {channel_id} is now allowed")
-        logger.info(f"Channel {channel_id} allowed by admin {update.effective_user.id}")
+        await update.message.reply_text(f"✅ Channel {channel_id} allowed")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove channel from allowed list"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not context.args:
-        await send_ephemeral(update, context, "Usage: /removechannel <channel_id>", settings)
+        await update.message.reply_text("Usage: /removechannel <channel_id>")
         return
     
     try:
         channel_id = int(context.args[0])
-    except ValueError:
-        await send_ephemeral(update, context, "❌ Invalid channel ID", settings)
-        return
-    
-    # Don't allow removing owner channel
-    if channel_id == OWNER_CHANNEL_ID:
-        await update.message.reply_text("❌ Cannot remove owner channel from allowed list")
-        return
-    
-    try:
+        if channel_id == OWNER_CHANNEL_ID:
+            await update.message.reply_text("❌ Cannot remove owner channel")
+            return
         db.execute("DELETE FROM allowed_channels WHERE channel_id = %s;", (channel_id,))
         state.allowed_channels.discard(channel_id)
-        await update.message.reply_text(f"✅ Channel {channel_id} removed")
+        await update.message.reply_text(f"✅ Channel removed")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List allowed channels"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    channels_list = []
-    for cid in sorted(state.allowed_channels):
-        if cid == OWNER_CHANNEL_ID:
-            channels_list.append(f"• <code>{cid}</code> (Owner - Protected)")
+    channels = []
+    for c in state.allowed_channels:
+        if c == OWNER_CHANNEL_ID:
+            channels.append(f"• <code>{c}</code> (Owner)")
         else:
-            channels_list.append(f"• <code>{cid}</code>")
+            channels.append(f"• <code>{c}</code>")
     
-    channels_text = "\n".join(channels_list) if channels_list else "No channels allowed"
-    await update.message.reply_text(f"📢 <b>Allowed Channels ({len(state.allowed_channels)}):</b>\n\n{channels_text}", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"📢 <b>Allowed Channels:</b>\n\n" + "\n".join(channels), parse_mode=ParseMode.HTML)
 
 
 async def cmd_allowforward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow user to forward messages"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /allowforward <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /allowforward <user_id>")
         return
     
     try:
-        db.execute(
-            "INSERT INTO forward_whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
-            (target_user_id, update.effective_user.id)
-        )
-        state.forward_whitelist_users.add(target_user_id)
-        await update.message.reply_text(f"✅ User {target_user_id} can now forward messages")
+        db.execute("INSERT INTO forward_whitelist (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;", (target, update.effective_user.id))
+        state.forward_whitelist.add(target)
+        await update.message.reply_text(f"✅ User {target} can forward now")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_revokeforward(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Revoke forward permission"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /revokeforward <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /revokeforward <user_id>")
         return
     
     try:
-        db.execute("DELETE FROM forward_whitelist WHERE user_id = %s;", (target_user_id,))
-        state.forward_whitelist_users.discard(target_user_id)
-        await update.message.reply_text(f"❌ User {target_user_id} can no longer forward messages")
+        db.execute("DELETE FROM forward_whitelist WHERE user_id = %s;", (target,))
+        state.forward_whitelist.discard(target)
+        await update.message.reply_text(f"✅ Forward revoked for {target}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_listforwarders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List users with forward permission"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    if not state.forward_whitelist_users:
-        await update.message.reply_text("No users have forward permission.")
+    if not state.forward_whitelist:
+        await update.message.reply_text("No forwarders.")
         return
     
-    users_text = "\n".join(f"• <code>{uid}</code>" for uid in sorted(state.forward_whitelist_users))
-    await update.message.reply_text(f"↗️ <b>Forward Whitelist ({len(state.forward_whitelist_users)}):</b>\n\n{users_text}", parse_mode=ParseMode.HTML)
+    users = "\n".join(f"• <code>{u}</code>" for u in state.forward_whitelist)
+    await update.message.reply_text(f"↗️ <b>Forward Whitelist:</b>\n\n{users}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_trust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add trusted user"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /trust <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /trust <user_id>")
         return
     
     try:
-        db.execute(
-            "INSERT INTO trusted_users (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
-            (target_user_id, update.effective_user.id)
-        )
-        state.trusted_users.add(target_user_id)
-        await update.message.reply_text(f"✅ User {target_user_id} is now trusted (bypasses all checks)")
+        db.execute("INSERT INTO trusted_users (user_id, added_by) VALUES (%s, %s) ON CONFLICT DO NOTHING;", (target, update.effective_user.id))
+        state.trusted_users.add(target)
+        await update.message.reply_text(f"✅ User {target} is now trusted (bypasses all checks)")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_untrust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove trusted user"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /untrust <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /untrust <user_id>")
         return
     
     try:
-        db.execute("DELETE FROM trusted_users WHERE user_id = %s;", (target_user_id,))
-        state.trusted_users.discard(target_user_id)
-        await update.message.reply_text(f"❌ User {target_user_id} is no longer trusted")
+        db.execute("DELETE FROM trusted_users WHERE user_id = %s;", (target,))
+        state.trusted_users.discard(target)
+        await update.message.reply_text(f"✅ User {target} removed from trusted")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_listtrusted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List trusted users"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not state.trusted_users:
         await update.message.reply_text("No trusted users.")
         return
     
-    users_text = "\n".join(f"• <code>{uid}</code>" for uid in sorted(state.trusted_users))
-    await update.message.reply_text(f"👤 <b>Trusted Users ({len(state.trusted_users)}):</b>\n\n{users_text}", parse_mode=ParseMode.HTML)
+    users = "\n".join(f"• <code>{u}</code>" for u in state.trusted_users)
+    await update.message.reply_text(f"👤 <b>Trusted Users:</b>\n\n{users}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually warn a user"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /warn <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /warn <user_id>")
         return
     
-    state.user_warnings[target_user_id] = state.user_warnings.get(target_user_id, 0) + 1
-    count = state.user_warnings[target_user_id]
+    state.user_warnings[target] = state.user_warnings.get(target, 0) + 1
+    count = state.user_warnings[target]
     
-    await update.message.reply_text(
-        f"⚠️ User <code>{target_user_id}</code> warned by admin.\nWarnings: {count}/{state.max_warnings}",
-        parse_mode=ParseMode.HTML
-    )
+    await update.message.reply_text(f"⚠️ User <code>{target}</code> warned.\nWarnings: {count}/{state.max_warnings}", parse_mode=ParseMode.HTML)
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ban a user"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /ban <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /ban <user_id>")
         return
     
     try:
-        await context.bot.ban_chat_member(
-            chat_id=update.effective_chat.id,
-            user_id=target_user_id
-        )
+        await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=target)
         state.users_banned += 1
-        await update.message.reply_text(f"🚫 User <code>{target_user_id}</code> has been banned.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"🚫 User <code>{target}</code> banned", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to ban: {e}")
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unban a user"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not context.args:
-        await send_ephemeral(update, context, "Usage: /unban <user_id>", settings)
+        await update.message.reply_text("Usage: /unban <user_id>")
         return
     
     try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await send_ephemeral(update, context, "❌ Invalid user ID", settings)
-        return
-    
-    try:
-        await context.bot.unban_chat_member(
-            chat_id=update.effective_chat.id,
-            user_id=target_user_id,
-            only_if_banned=True
-        )
-        db.execute("DELETE FROM banned_users WHERE user_id = %s AND chat_id = %s;", (target_user_id, update.effective_chat.id))
-        await update.message.reply_text(f"✅ User <code>{target_user_id}</code> has been unbanned.", parse_mode=ParseMode.HTML)
+        target = int(context.args[0])
+        await context.bot.unban_chat_member(chat_id=update.effective_chat.id, user_id=target, only_if_banned=True)
+        db.execute("DELETE FROM banned_users WHERE user_id = %s AND chat_id = %s;", (target, update.effective_chat.id))
+        await update.message.reply_text(f"✅ User <code>{target}</code> unbanned", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to unban: {e}")
+        await update.message.reply_text(f"❌ Failed: {e}")
 
 
 async def cmd_resetwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reset user warnings"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    target_user_id: Optional[int] = None
-    
+    target = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        target_user_id = update.message.reply_to_message.from_user.id
+        target = update.message.reply_to_message.from_user.id
     elif context.args:
         try:
-            target_user_id = int(context.args[0])
-        except ValueError:
+            target = int(context.args[0])
+        except:
             pass
     
-    if not target_user_id:
-        await send_ephemeral(update, context, "Usage: Reply to a user or /resetwarnings <user_id>", settings)
+    if not target:
+        await update.message.reply_text("Reply to user or /resetwarnings <user_id>")
         return
     
-    state.user_warnings.pop(target_user_id, None)
-    await update.message.reply_text(f"✅ Warnings reset for user <code>{target_user_id}</code>", parse_mode=ParseMode.HTML)
+    state.user_warnings.pop(target, None)
+    await update.message.reply_text(f"✅ Warnings reset for <code>{target}</code>", parse_mode=ParseMode.HTML)
 
 
-async def cmd_setmaxwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set max warnings before ban"""
+async def cmd_setwarnings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
     if not context.args:
-        # FIX: Use &lt; and &gt; instead of < and >
-        await send_ephemeral(update, context, f"Current: {state.max_warnings}\nUsage: /setmaxwarnings &lt;number&gt;", settings)
-        return
-        
-    try:
-        new_max = max(1, int(context.args[0]))
-    except ValueError:
-        await send_ephemeral(update, context, "❌ Please provide a valid number", settings)
+        await update.message.reply_text(f"Current: {state.max_warnings}\nUsage: /setwarnings <number>")
         return
     
     try:
+        n = max(1, int(context.args[0]))
         db.execute(
-            """INSERT INTO bot_settings (setting_key, setting_value, updated_by)
-               VALUES ('max_warnings', %s, %s)
-               ON CONFLICT (setting_key) DO UPDATE SET setting_value = %s, updated_at = CURRENT_TIMESTAMP;""",
-            (str(new_max), update.effective_user.id, str(new_max))
+            "INSERT INTO bot_settings (key, value) VALUES ('max_warnings', %s) ON CONFLICT (key) DO UPDATE SET value = %s;",
+            (str(n), str(n))
         )
-        state.max_warnings = new_max
-        await update.message.reply_text(f"✅ Max warnings set to {new_max}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_addpattern(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add custom spam pattern"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
-        return
-    
-    if not context.args:
-        await send_ephemeral(update, context, "Usage: /addpattern <pattern>", settings)
-        return
-    
-    pattern = " ".join(context.args)
-    
-    try:
-        # Test if it's a valid regex
-        re.compile(pattern, re.IGNORECASE)
-        
-        db.execute(
-            "INSERT INTO spam_patterns (pattern, is_regex, added_by) VALUES (%s, TRUE, %s) ON CONFLICT DO NOTHING;",
-            (pattern, update.effective_user.id)
-        )
-        load_custom_spam_patterns()
-        await update.message.reply_text(f"✅ Pattern added: <code>{pattern[:100]}</code>", parse_mode=ParseMode.HTML)
-    except re.error as e:
-        await update.message.reply_text(f"❌ Invalid regex pattern: {e}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_removepattern(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove spam pattern"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
-        return
-    
-    if not context.args:
-        await send_ephemeral(update, context, "Usage: /removepattern <pattern>", settings)
-        return
-    
-    pattern = " ".join(context.args)
-    
-    try:
-        db.execute("DELETE FROM spam_patterns WHERE pattern = %s;", (pattern,))
-        load_custom_spam_patterns()
-        await update.message.reply_text(f"✅ Pattern removed")
+        state.max_warnings = n
+        await update.message.reply_text(f"✅ Max warnings set to {n}")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reload all caches"""
     settings: Settings = context.bot_data["settings"]
     
     if not is_admin(update.effective_user.id, settings):
-        await send_ephemeral(update, context, "❌ Admins only.", settings)
+        await update.message.reply_text("❌ Admins only.")
         return
     
-    reload_all_caches(settings)
-    await update.message.reply_text("✅ All caches reloaded!")
-
-
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Report a spam message"""
-    settings: Settings = context.bot_data["settings"]
-    
-    if not update.message.reply_to_message:
-        await send_ephemeral(update, context, "❌ Reply to a spam message to report it.", settings)
-        return
-    
-    spam_msg = update.message.reply_to_message
-    spam_text = spam_msg.text or spam_msg.caption or "[No text content]"
-    
-    try:
-        db.execute(
-            """INSERT INTO reported_spam (message, message_hash, reported_by, chat_id)
-               VALUES (%s, %s, %s, %s);""",
-            (spam_text[:2000], get_message_hash(spam_text), update.effective_user.id, update.effective_chat.id)
-        )
-        await update.message.reply_text("✅ Spam reported. Thank you for helping keep the group clean!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to report: {e}")
+    load_all_data(settings)
+    await update.message.reply_text("✅ All data reloaded!")
 
 
 # ============================================================
@@ -2067,62 +1227,13 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ============================================================
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors gracefully"""
-    error = context.error
-    
-    # Ignore common non-critical errors
-    if isinstance(error, (BadRequest, Forbidden)):
-        logger.debug(f"Telegram error: {error}")
+    if isinstance(context.error, (BadRequest, Forbidden)):
         return
-    
-    logger.error("Exception while handling update:", exc_info=error)
-    
-    # Try to notify user
-    if update and update.effective_chat:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="❌ An error occurred. Please try again later."
-            )
-        except Exception:
-            pass
+    logger.error("Error:", exc_info=context.error)
 
 
 # ============================================================
-# Background Tasks
-# ============================================================
-
-async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic cleanup of old data"""
-    now = datetime.now()
-    
-    # Clean rate limit data older than 1 hour
-    cutoff_ts = time.time() - 3600
-    state.message_rate_limit_ts = {
-        k: v for k, v in state.message_rate_limit_ts.items()
-        if v > cutoff_ts
-    }
-    
-    # Clean flood data older than 1 hour
-    for user_id in list(state.user_flood_data.keys()):
-        flood_data = state.user_flood_data[user_id]
-        flood_data.message_times = [t for t in flood_data.message_times if t > cutoff_ts]
-        if not flood_data.message_times:
-            del state.user_flood_data[user_id]
-    
-    # Clean old message times
-    cutoff_dt = now - timedelta(hours=24)
-    state.user_last_message_time = {
-        k: v for k, v in state.user_last_message_time.items()
-        if v > cutoff_dt
-    }
-    
-    state.last_cleanup = now
-    logger.debug("Cleanup completed")
-
-
-# ============================================================
-# Flask Keep-Alive Server
+# Flask Keep-Alive
 # ============================================================
 
 flask_app = Flask(__name__)
@@ -2131,12 +1242,11 @@ flask_app = Flask(__name__)
 @flask_app.route("/")
 def home():
     return jsonify({
-        "status": "running",
         "bot": "Guardian Bot",
         "version": BOT_VERSION,
-        "messages_processed": state.messages_processed,
-        "spam_detected": state.spam_detected,
-        "users_banned": state.users_banned,
+        "status": "running",
+        "ai": "enabled" if ai_model else "disabled",
+        "spam_blocked": state.spam_blocked
     })
 
 
@@ -2150,26 +1260,19 @@ def run_flask(port: int):
 
 
 # ============================================================
-# Application Builder
+# Build Application
 # ============================================================
 
-def build_application(settings: Settings) -> Application:
-    """Build the Telegram bot application"""
-    application = Application.builder().token(settings.telegram_bot_token).build()
+def build_app(settings: Settings) -> Application:
+    app = Application.builder().token(settings.telegram_bot_token).build()
     
-    # Error handler
-    application.add_error_handler(error_handler)
+    app.add_error_handler(error_handler)
     
-    # Command handlers
     commands = [
         ("start", cmd_start),
         ("help", cmd_help),
         ("stats", cmd_stats),
         ("status", cmd_status),
-        ("botversion", cmd_botversion),
-        ("addword", cmd_addword),
-        ("removeword", cmd_removeword),
-        ("listwords", cmd_listwords),
         ("allowchat", cmd_allowchat),
         ("allowthischat", cmd_allowthischat),
         ("removechat", cmd_removechat),
@@ -2187,109 +1290,78 @@ def build_application(settings: Settings) -> Application:
         ("ban", cmd_ban),
         ("unban", cmd_unban),
         ("resetwarnings", cmd_resetwarnings),
-        ("setmaxwarnings", cmd_setmaxwarnings),
-        ("addpattern", cmd_addpattern),
-        ("removepattern", cmd_removepattern),
+        ("setwarnings", cmd_setwarnings),
         ("reload", cmd_reload),
-        ("report", cmd_report),
     ]
     
-    for cmd_name, handler in commands:
-        application.add_handler(CommandHandler(cmd_name, handler))
+    for name, handler in commands:
+        app.add_handler(CommandHandler(name, handler))
     
-    # Message handler for all non-command messages
-    application.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND,
-        handle_message
-    ))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     
-    # Store settings
-    application.bot_data["settings"] = settings
+    app.bot_data["settings"] = settings
     
-    # Add job for cleanup
-    if application.job_queue:
-        application.job_queue.run_repeating(
-            cleanup_old_data,
-            interval=timedelta(minutes=30),
-            first=timedelta(minutes=5)
-        )
-    else:
-        logger.warning("⚠️ JobQueue not available. Install 'python-telegram-bot[job-queue]' to enable background cleanup.")
-    
-    return application
+    return app
 
 
 # ============================================================
-# Main Entry Point
+# Main
 # ============================================================
 
 def main() -> None:
-    """Main entry point"""
     print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║           🛡️  GUARDIAN BOT v{BOT_VERSION}  🛡️                     ║
-║                Ultra Powerful Edition                        ║
-╚══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║       🛡️  GUARDIAN BOT v{BOT_VERSION} - AI EDITION  🛡️        ║
+║         All Languages • Smart Detection • Fast            ║
+╚═══════════════════════════════════════════════════════════╝
 """)
     
-    # Load settings
     settings = Settings.from_env()
-    # --- YE LINE ADD KAREIN DEBUGGING KE LIYE ---
-    print(f"DEBUG: Loaded Admin IDs: {settings.admin_user_ids}")
-    print(f"DEBUG: Checking against Type: {type(settings.admin_user_ids)}")
-    validate_settings(settings)
     
-    # Initialize database
+    if not settings.telegram_bot_token:
+        print("❌ TELEGRAM_BOT_TOKEN not set!")
+        sys.exit(1)
+    
+    if not settings.database_url:
+        print("❌ DATABASE_URL not set!")
+        sys.exit(1)
+    
+    # Database
     global db
     db = Database.get_instance(settings.database_url)
     setup_database()
+    load_all_data(settings)
     
-    # Load all caches
-    reload_all_caches(settings)
+    # AI
+    init_ai(settings)
     
-    # Initialize AI
-    ai_init(settings)
-    
-    # Start Flask server in background
-    flask_thread = threading.Thread(
-        target=run_flask,
-        args=(settings.port,),
-        daemon=True
-    )
+    # Flask
+    flask_thread = threading.Thread(target=run_flask, args=(settings.port,), daemon=True)
     flask_thread.start()
-    logger.info(f"🌐 Flask server started on port {settings.port}")
     
-    # Build application
-    app = build_application(settings)
+    # Build app
+    app = build_app(settings)
     
-    # Graceful shutdown handler
-    def shutdown_handler(signum, frame):
-        logger.info("⏹️ Shutting down...")
+    # Shutdown handler
+    def shutdown(sig, frame):
+        logger.info("Shutting down...")
         if db:
             db.close()
         sys.exit(0)
     
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
     
-    # Start bot
     logger.info(f"""
 🛡️ Guardian Bot Started!
 ├── Version: {BOT_VERSION}
-├── AI: {'✅ Enabled' if settings.ai_enabled else '❌ Disabled'}
-├── Owner Channel: {OWNER_CHANNEL_ID}
-├── Max Warnings: {state.max_warnings}
-├── Allowed Chats: {len(state.allowed_chats)}
-├── Allowed Channels: {len(state.allowed_channels)}
-├── Blacklist Words: {len(state.blacklist_words)}
+├── AI: {'✅ Enabled' if ai_model else '❌ Disabled (Set GEMINI_API_KEY)'}
+├── Chats: {len(state.allowed_chats)}
+├── Channels: {len(state.allowed_channels)}
 └── Port: {settings.port}
 """)
     
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False,
-    )
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
